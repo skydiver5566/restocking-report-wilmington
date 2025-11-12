@@ -1,5 +1,6 @@
 name = "Restocking Report"
 handle = "restocking-report"
+client_id = "d6d4cc9c2e1ee49df0b30a5e6c3b5e1b"
 
 application_url = "https://restocking-report.onrender.com"
 embedded = true
