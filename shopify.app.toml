@@ -17,3 +17,7 @@ dev_store_url = "learning-express-dev-store.myshopify.com"
 
 [access_scopes]
 scopes = "read_inventory,read_locations,read_orders,read_products"
+
+[webhooks]
+api_version = "2024-07"
+subscriptions = []
