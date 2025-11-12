@@ -1,24 +1,18 @@
-client_id = "d6d4cc9c2e1ee49df0b30a5e6c3b5e1b"
 name = "Restocking Report"
+handle = "restocking-report"
+
 application_url = "https://restocking-report.onrender.com"
 embedded = true
 
+[auth]
+redirect_urls = [
+  "https://restocking-report.onrender.com/auth/callback",
+  "https://restocking-report.onrender.com/auth/shopify/callback"
+]
+
 [build]
 automatically_update_urls_on_dev = true
-
-[webhooks]
-api_version = "2026-01"
-
-  [[webhooks.subscriptions]]
-  topics = [ "app/uninstalled" ]
-  uri = "/webhooks/app/uninstalled"
-
-  [[webhooks.subscriptions]]
-  topics = [ "app/scopes_update" ]
-  uri = "/webhooks/app/scopes_update"
+dev_store_url = "learning-express-dev-store.myshopify.com"
 
 [access_scopes]
-scopes = "read_orders,read_inventory,read_products,read_locations"
-
-[auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+scopes = "read_inventory,read_locations,read_orders,read_products"
