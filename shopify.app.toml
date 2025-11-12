@@ -1,6 +1,6 @@
 client_id = "d6d4cc9c2e1ee49df0b30a5e6c3b5e1b"
 name = "Restocking Report"
-application_url = "https://example.com"
+application_url = "https://restocking-report.onrender.com"
 embedded = true
 
 [build]
