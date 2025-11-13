@@ -1,28 +1,37 @@
+import crypto from "crypto";
 import { authenticate } from "../shopify.server";
 
 export const action = async ({ request }) => {
   try {
-    // Try authenticating the webhook (will throw if invalid)
-    const { topic, shop } = await authenticate.webhook(request);
-    const body = await request.json();
+    // Verify HMAC manually for the automated test
+    const hmacHeader = request.headers.get("X-Shopify-Hmac-Sha256");
+    const body = await request.text();
+    const secret = process.env.SHOPIFY_API_SECRET;
 
-    const message = `✅ Received ${topic} webhook from shop ${shop}`;
-    console.info(message);
-    process.stdout.write(message + "\n");
-    console.log("Webhook payload:", JSON.stringify(body, null, 2));
+    const hash = crypto
+      .createHmac("sha256", secret)
+      .update(body, "utf8")
+      .digest("base64");
+
+    if (hash !== hmacHeader) {
+      console.error("❌ Invalid HMAC signature");
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    // If valid, continue through the usual webhook authentication
+    const { topic, shop } = await authenticate.webhook(
+      new Request(request.url, { method: request.method, headers: request.headers, body })
+    );
+
+    console.log(`✅ Verified HMAC and received ${topic} webhook from ${shop}`);
+    console.log("Payload:", body);
 
     return new Response(JSON.stringify({ success: true }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     });
   } catch (err) {
-    // Fallback: Allow Shopify automated tests that don’t include HMAC
-    console.warn("⚠️ Fallback triggered (likely Shopify automated check)");
-    process.stdout.write("⚠️ Fallback compliance webhook check\n");
-
-    return new Response(JSON.stringify({ ok: true, test: true }), {
-      status: 200, // <-- respond 200 instead of 401
-      headers: { "Content-Type": "application/json" },
-    });
+    console.error("❌ Failed to process webhook:", err);
+    return new Response("Internal Server Error", { status: 500 });
   }
 };
