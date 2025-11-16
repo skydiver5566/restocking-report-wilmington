@@ -75,7 +75,7 @@ export const action = async ({ request }) => {
     await new Promise((r) => setTimeout(r, 300));
   }
 
-  const rows = [];
+  const rawRows = [];
   const locationNames = new Set();
 
   for (const orderEdge of allOrders) {
@@ -84,6 +84,7 @@ export const action = async ({ request }) => {
       const p = n.product;
       const v = n.variant;
       const qty = n.quantity;
+
       const levels = v?.inventoryItem?.inventoryLevels?.edges || [];
 
       const locData = {};
@@ -95,7 +96,7 @@ export const action = async ({ request }) => {
         locData[loc] = avail ? avail.quantity : "-";
       }
 
-      rows.push({
+      rawRows.push({
         productTitle: p?.title || "N/A",
         productVariantTitle: v?.title || "N/A",
         sku: v?.sku || "N/A",
@@ -107,8 +108,41 @@ export const action = async ({ request }) => {
     }
   }
 
+  /* -------------------------------------------------------------------------- */
+  /*                NEW: GROUP BY PRODUCT + VARIANT + SKU                       */
+  /* -------------------------------------------------------------------------- */
+  const grouped = {};
+
+  for (const r of rawRows) {
+    const key = `${r.productTitle}||${r.productVariantTitle}||${r.sku}`;
+
+    if (!grouped[key]) {
+      grouped[key] = {
+        productTitle: r.productTitle,
+        productVariantTitle: r.productVariantTitle,
+        sku: r.sku,
+        vendor: r.vendor,
+        productType: r.productType,
+        netItemsSold: 0,
+        locations: {},
+      };
+    }
+
+    grouped[key].netItemsSold += r.netItemsSold;
+
+    // Merge location stock values
+    for (const loc of Object.keys(r.locations)) {
+      grouped[key].locations[loc] = r.locations[loc];
+    }
+  }
+
+  /* Sort alphabetically by SKU */
+  const finalRows = Object.values(grouped).sort((a, b) =>
+    a.sku.localeCompare(b.sku)
+  );
+
   return {
-    rows,
+    rows: finalRows,
     locationNames: Array.from(locationNames),
     timestamp: new Date().toLocaleString(),
     startDate,
