@@ -20,20 +20,18 @@ export const action = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
   const formData = await request.formData();
 
-  // Keep original strings for display
+  // Keep original form strings for display
   const startDateStr = formData.get("startDate");
   const endDateStr = formData.get("endDate");
 
-  // Parse as JS Dates (interpreted as local time on the server)
+  // Parse dates (local timezone – as requested)
   const startDate = new Date(startDateStr);
   const endDate = new Date(endDateStr);
+  endDate.setSeconds(59, 999); // Inclusive range
 
-  // Make endDate inclusive to the end of that minute
-  endDate.setSeconds(59, 999);
-
-  // NOTE: We do NOT use created_at in the GraphQL search query.
-  // Shopify's GraphQL Admin API does not support createdAt range filters via `query` the same way REST does.
-  // Instead, we fetch orders sorted by createdAt and filter them in JS.
+  /* -------------------------------------------------------------------------- */
+  /*                           GraphQL Query (Light)                            */
+  /* -------------------------------------------------------------------------- */
   const ORDERS_QUERY = `
     query RestockingReportOrders($cursor: String) {
       orders(
@@ -50,11 +48,7 @@ export const action = async ({ request }) => {
               edges {
                 node {
                   quantity
-                  product {
-                    title
-                    vendor
-                    productType
-                  }
+                  product { title vendor productType }
                   variant {
                     title
                     sku
@@ -66,9 +60,7 @@ export const action = async ({ request }) => {
                               name
                               quantity
                             }
-                            location {
-                              name
-                            }
+                            location { name }
                           }
                         }
                       }
@@ -87,9 +79,13 @@ export const action = async ({ request }) => {
     }
   `;
 
+  /* -------------------------------------------------------------------------- */
+  /*                           PAGINATION + THROTTLING                          */
+  /* -------------------------------------------------------------------------- */
   let allOrders = [];
   let cursor = null;
   let hasNextPage = true;
+  let pageCount = 0;
 
   while (hasNextPage) {
     const response = await admin.graphql(ORDERS_QUERY, {
@@ -99,16 +95,14 @@ export const action = async ({ request }) => {
     const data = await response.json();
 
     if (data.errors) {
-      console.error("GraphQL errors:", JSON.stringify(data.errors, null, 2));
+      console.error("GraphQL Errors:", data.errors);
       break;
     }
 
-    const ordersConnection = data?.data?.orders;
-    if (!ordersConnection) break;
+    const ordersConnection = data.data.orders;
+    const edges = ordersConnection.edges;
 
-    const edges = ordersConnection.edges || [];
-
-    // 🔥 Filter by createdAt BETWEEN startDate and endDate (inclusive)
+    // FILTER BY DATE RANGE
     for (const edge of edges) {
       const created = new Date(edge.node.createdAt);
       if (created >= startDate && created <= endDate) {
@@ -116,20 +110,32 @@ export const action = async ({ request }) => {
       }
     }
 
-    hasNextPage = ordersConnection.pageInfo.hasNextPage;
+    // COST-AWARE THROTTLING
+    const cost = data.extensions?.cost;
+    if (cost) {
+      const remaining = cost.throttleStatus.currentlyAvailable;
+      const requested = cost.requestedQueryCost;
+      const restoreRate = cost.throttleStatus.restoreRate;
+
+      if (remaining < requested) {
+        const wait = restoreRate * 1000;
+        console.log(`Throttled → waiting ${wait}ms`);
+        await new Promise((res) => setTimeout(res, wait));
+      }
+    }
+
     cursor = ordersConnection.pageInfo.endCursor;
+    hasNextPage = ordersConnection.pageInfo.hasNextPage;
 
-    // Safety guard so we don't go insane on very busy stores
-    if (allOrders.length > 1000) break;
-
-    // Small delay for politeness towards rate limits
-    await new Promise((r) => setTimeout(r, 300));
+    // SAFETY LIMITS for live stores
+    pageCount++;
+    if (pageCount > 20) break;         // Max 20 pages (≈1000 orders)
+    if (allOrders.length > 500) break; // Plenty for any time slice
   }
 
   /* -------------------------------------------------------------------------- */
-  /*                      BUILD ROWS FROM FILTERED ORDERS                       */
+  /*                         BUILD ROWS FROM FILTERED ORDERS                    */
   /* -------------------------------------------------------------------------- */
-
   const rawRows = [];
   const locationNames = new Set();
 
@@ -140,7 +146,6 @@ export const action = async ({ request }) => {
       const n = liEdge.node;
       const p = n.product;
       const v = n.variant;
-      const qty = n.quantity;
 
       const levels = v?.inventoryItem?.inventoryLevels?.edges || [];
 
@@ -159,16 +164,15 @@ export const action = async ({ request }) => {
         sku: v?.sku || "N/A",
         vendor: p?.vendor || "N/A",
         productType: p?.productType || "N/A",
-        netItemsSold: qty,
+        netItemsSold: n.quantity,
         locations: locData,
       });
     }
   }
 
   /* -------------------------------------------------------------------------- */
-  /*                GROUP BY PRODUCT + VARIANT + SKU & SUM QTY                  */
+  /*                     GROUP BY PRODUCT + VARIANT + SKU                       */
   /* -------------------------------------------------------------------------- */
-
   const grouped = {};
 
   for (const r of rawRows) {
@@ -188,13 +192,11 @@ export const action = async ({ request }) => {
 
     grouped[key].netItemsSold += r.netItemsSold;
 
-    // Merge location stock values
     for (const loc of Object.keys(r.locations)) {
       grouped[key].locations[loc] = r.locations[loc];
     }
   }
 
-  // Sort alphabetically by SKU
   const finalRows = Object.values(grouped).sort((a, b) =>
     a.sku.localeCompare(b.sku)
   );
@@ -216,6 +218,7 @@ export default function RestockingReport() {
   const navigation = useNavigation();
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
+
   const loading = navigation.state === "submitting";
 
   return (
@@ -247,6 +250,7 @@ export default function RestockingReport() {
               <Text as="h2" variant="headingMd">
                 Generate Report
               </Text>
+
               <Form method="post">
                 <BlockStack gap="200">
                   <TextField
@@ -265,6 +269,7 @@ export default function RestockingReport() {
                     onChange={setEndDate}
                     required
                   />
+
                   <Button submit primary>
                     Run Report
                   </Button>
@@ -274,15 +279,17 @@ export default function RestockingReport() {
           </Card>
         </Layout.Section>
 
+        {/* Loading State */}
         {loading && (
           <Layout.Section>
             <Card>
               <Spinner accessibilityLabel="Loading" size="large" />
-              <Text>Fetching data...</Text>
+              <Text>Fetching data…</Text>
             </Card>
           </Layout.Section>
         )}
 
+        {/* Results */}
         {data && (
           <Layout.Section>
             <Card>
@@ -306,6 +313,7 @@ export default function RestockingReport() {
                       ))}
                     </tr>
                   </thead>
+
                   <tbody>
                     {data.rows.map((r, i) => (
                       <tr key={i}>
