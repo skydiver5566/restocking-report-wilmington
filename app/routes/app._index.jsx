@@ -14,24 +14,150 @@ import { useActionData, useNavigation, Form } from "react-router-dom";
 import { authenticate } from "../shopify.server";
 
 /* -------------------------------------------------------------------------- */
+/*                             Helper: TZ Mapping                             */
+/* -------------------------------------------------------------------------- */
+
+// Map Shopify Rails timezones -> IANA (US only, per your choice)
+const RAILS_TZ_TO_IANA = {
+  "Eastern Time (US & Canada)": "America/New_York",
+  "Central Time (US & Canada)": "America/Chicago",
+  "Mountain Time (US & Canada)": "America/Denver",
+  "Pacific Time (US & Canada)": "America/Los_Angeles",
+};
+
+/**
+ * Parse a datetime-local string (e.g. "2025-11-16T18:50")
+ * and convert it from local time in `timeZone` to a UTC Date.
+ *
+ * This avoids relying on server local timezone and is DST-safe.
+ */
+function zonedDateTimeToUtc(datetimeStr, timeZone) {
+  if (!datetimeStr) return null;
+
+  const [datePart, timePart] = datetimeStr.split("T");
+  if (!datePart || !timePart) return null;
+
+  const [yearStr, monthStr, dayStr] = datePart.split("-");
+  const [hourStr, minuteStr = "0"] = timePart.split(":");
+
+  const year = Number(yearStr);
+  const month = Number(monthStr);
+  const day = Number(dayStr);
+  const hour = Number(hourStr);
+  const minute = Number(minuteStr);
+
+  if (
+    [year, month, day, hour, minute].some(
+      (n) => Number.isNaN(n) || !Number.isFinite(n)
+    )
+  ) {
+    return null;
+  }
+
+  // 1) Create a "naive" UTC date from the local wall time components
+  const naiveUtc = new Date(Date.UTC(year, month - 1, day, hour, minute, 0, 0));
+
+  // 2) Use Intl.DateTimeFormat to see what local time that naive UTC instant
+  //    corresponds to in the target time zone
+  const dtf = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+
+  const parts = dtf.formatToParts(naiveUtc);
+  const map = {};
+  for (const p of parts) {
+    if (p.type !== "literal") {
+      map[p.type] = p.value;
+    }
+  }
+
+  // Local time (in the given zone) that corresponds to `naiveUtc`
+  const localAsIfUtcMs = Date.UTC(
+    Number(map.year),
+    Number(map.month) - 1,
+    Number(map.day),
+    Number(map.hour),
+    Number(map.minute),
+    Number(map.second)
+  );
+
+  // Offset between that zone's local time and naiveUtc
+  const offsetMs = localAsIfUtcMs - naiveUtc.getTime();
+
+  // Actual UTC instant for the user-entered wall clock
+  const actualUtcMs = naiveUtc.getTime() - offsetMs;
+  return new Date(actualUtcMs);
+}
+
+/* -------------------------------------------------------------------------- */
 /*                               SERVER ACTION                                */
 /* -------------------------------------------------------------------------- */
 export const action = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
   const formData = await request.formData();
 
-  // Keep original form strings for display
-  const startDateStr = formData.get("startDate");
+  const startDateStr = formData.get("startDate"); // datetime-local string
   const endDateStr = formData.get("endDate");
 
-  // Parse dates (local timezone – as requested)
-  const startDate = new Date(startDateStr);
-  const endDate = new Date(endDateStr);
-  endDate.setSeconds(59, 999); // Inclusive range
+  /* ------------------------------------------------------------------------ */
+  /*                      1) Fetch Store Timezone from Shopify                */
+  /* ------------------------------------------------------------------------ */
+  const SHOP_TZ_QUERY = `
+    query ShopTimezone {
+      shop {
+        timezone
+      }
+    }
+  `;
 
-  /* -------------------------------------------------------------------------- */
-  /*                           GraphQL Query (Light)                            */
-  /* -------------------------------------------------------------------------- */
+  let storeRailsTz = "Eastern Time (US & Canada)";
+  let storeIanaTz = "America/New_York";
+
+  try {
+    const shopResp = await admin.graphql(SHOP_TZ_QUERY);
+    const shopJson = await shopResp.json();
+    const tz = shopJson?.data?.shop?.timezone;
+    if (tz && typeof tz === "string") {
+      storeRailsTz = tz;
+      storeIanaTz = RAILS_TZ_TO_IANA[tz] || "UTC";
+    }
+  } catch (err) {
+    console.error("Error fetching shop timezone:", err);
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /*              2) Convert user-entered local times -> UTC Dates            */
+  /* ------------------------------------------------------------------------ */
+  const startUTC = zonedDateTimeToUtc(startDateStr, storeIanaTz);
+  const endUTC = zonedDateTimeToUtc(endDateStr, storeIanaTz);
+
+  if (!startUTC || !endUTC) {
+    return {
+      rows: [],
+      locationNames: [],
+      timestamp: new Date().toLocaleString("en-US", {
+        timeZone: storeIanaTz,
+      }),
+      startDate: startDateStr,
+      endDate: endDateStr,
+      error: "Invalid date input",
+      shopTimezone: storeRailsTz,
+    };
+  }
+
+  // Make end inclusive for that minute
+  endUTC.setSeconds(59, 999);
+
+  /* ------------------------------------------------------------------------ */
+  /*                          3) GraphQL Orders Query                         */
+  /* ------------------------------------------------------------------------ */
   const ORDERS_QUERY = `
     query RestockingReportOrders($cursor: String) {
       orders(
@@ -71,46 +197,42 @@ export const action = async ({ request }) => {
             }
           }
         }
-        pageInfo {
-          hasNextPage
-          endCursor
-        }
+        pageInfo { hasNextPage endCursor }
       }
     }
   `;
 
-  /* -------------------------------------------------------------------------- */
-  /*                           PAGINATION + THROTTLING                          */
-  /* -------------------------------------------------------------------------- */
+  /* ------------------------------------------------------------------------ */
+  /*                 4) Pagination + Rate-Limit Safe Loop                     */
+  /* ------------------------------------------------------------------------ */
   let allOrders = [];
   let cursor = null;
   let hasNextPage = true;
   let pageCount = 0;
 
   while (hasNextPage) {
-    const response = await admin.graphql(ORDERS_QUERY, {
-      variables: { cursor },
-    });
-
+    const response = await admin.graphql(ORDERS_QUERY, { variables: { cursor } });
     const data = await response.json();
 
     if (data.errors) {
-      console.error("GraphQL Errors:", data.errors);
+      console.error("GraphQL errors:", data.errors);
       break;
     }
 
-    const ordersConnection = data.data.orders;
-    const edges = ordersConnection.edges;
+    const connection = data?.data?.orders;
+    if (!connection) break;
 
-    // FILTER BY DATE RANGE
+    const edges = connection.edges || [];
+
+    // Filter orders by createdAt in UTC
     for (const edge of edges) {
-      const created = new Date(edge.node.createdAt);
-      if (created >= startDate && created <= endDate) {
+      const createdUTC = new Date(edge.node.createdAt); // Shopify returns UTC
+      if (createdUTC >= startUTC && createdUTC <= endUTC) {
         allOrders.push(edge);
       }
     }
 
-    // COST-AWARE THROTTLING
+    // Cost-aware throttling (avoid GraphQL "Throttled" errors)
     const cost = data.extensions?.cost;
     if (cost) {
       const remaining = cost.throttleStatus.currentlyAvailable;
@@ -119,43 +241,43 @@ export const action = async ({ request }) => {
 
       if (remaining < requested) {
         const wait = restoreRate * 1000;
-        console.log(`Throttled → waiting ${wait}ms`);
-        await new Promise((res) => setTimeout(res, wait));
+        console.log(`Throttled → waiting ${wait} ms`);
+        await new Promise((r) => setTimeout(r, wait));
       }
     }
 
-    cursor = ordersConnection.pageInfo.endCursor;
-    hasNextPage = ordersConnection.pageInfo.hasNextPage;
+    cursor = connection.pageInfo.endCursor;
+    hasNextPage = connection.pageInfo.hasNextPage;
 
-    // SAFETY LIMITS for live stores
+    // Safety caps for live stores
     pageCount++;
-    if (pageCount > 20) break;         // Max 20 pages (≈1000 orders)
-    if (allOrders.length > 500) break; // Plenty for any time slice
+    if (pageCount > 20) break;        // max 20 pages (~1000 orders)
+    if (allOrders.length > 500) break; // enough for any small time window
   }
 
-  /* -------------------------------------------------------------------------- */
-  /*                         BUILD ROWS FROM FILTERED ORDERS                    */
-  /* -------------------------------------------------------------------------- */
+  /* ------------------------------------------------------------------------ */
+  /*                         5) Build Raw Rows from Orders                    */
+  /* ------------------------------------------------------------------------ */
   const rawRows = [];
   const locationNames = new Set();
 
-  for (const orderEdge of allOrders) {
-    const orderNode = orderEdge.node;
-
-    for (const liEdge of orderNode.lineItems.edges) {
-      const n = liEdge.node;
+  for (const order of allOrders) {
+    for (const li of order.node.lineItems.edges) {
+      const n = li.node;
       const p = n.product;
       const v = n.variant;
+      const qty = n.quantity;
 
       const levels = v?.inventoryItem?.inventoryLevels?.edges || [];
-
       const locData = {};
-      for (const lvlEdge of levels) {
-        const lvl = lvlEdge.node;
-        const avail = lvl.quantities?.find((q) => q.name === "available");
-        const loc = lvl.location?.name || "Unknown";
-        locationNames.add(loc);
-        locData[loc] = avail ? avail.quantity : "-";
+
+      for (const lvl of levels) {
+        const locName = lvl.node.location?.name || "Unknown";
+        const available = lvl.node.quantities?.find(
+          (q) => q.name === "available"
+        );
+        locationNames.add(locName);
+        locData[locName] = available ? available.quantity : "-";
       }
 
       rawRows.push({
@@ -164,15 +286,15 @@ export const action = async ({ request }) => {
         sku: v?.sku || "N/A",
         vendor: p?.vendor || "N/A",
         productType: p?.productType || "N/A",
-        netItemsSold: n.quantity,
+        netItemsSold: qty,
         locations: locData,
       });
     }
   }
 
-  /* -------------------------------------------------------------------------- */
-  /*                     GROUP BY PRODUCT + VARIANT + SKU                       */
-  /* -------------------------------------------------------------------------- */
+  /* ------------------------------------------------------------------------ */
+  /*                  6) Group By Product + Variant + SKU                     */
+  /* ------------------------------------------------------------------------ */
   const grouped = {};
 
   for (const r of rawRows) {
@@ -201,12 +323,18 @@ export const action = async ({ request }) => {
     a.sku.localeCompare(b.sku)
   );
 
+  /* ------------------------------------------------------------------------ */
+  /*                                7) Return                                 */
+  /* ------------------------------------------------------------------------ */
   return {
     rows: finalRows,
     locationNames: Array.from(locationNames),
-    timestamp: new Date().toLocaleString(),
+    timestamp: new Date().toLocaleString("en-US", {
+      timeZone: storeIanaTz,
+    }),
     startDate: startDateStr,
     endDate: endDateStr,
+    shopTimezone: storeRailsTz,
   };
 };
 
@@ -218,11 +346,10 @@ export default function RestockingReport() {
   const navigation = useNavigation();
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
-
   const loading = navigation.state === "submitting";
 
   return (
-    <Page title="Restocking Report">
+    <Page title="Restocking Report Wilmington">
       <style>
         {`
           table {
@@ -247,9 +374,7 @@ export default function RestockingReport() {
         <Layout.Section>
           <Card>
             <BlockStack gap="400">
-              <Text as="h2" variant="headingMd">
-                Generate Report
-              </Text>
+              <Text variant="headingLg">Restocking Report</Text>
 
               <Form method="post">
                 <BlockStack gap="200">
@@ -269,7 +394,6 @@ export default function RestockingReport() {
                     onChange={setEndDate}
                     required
                   />
-
                   <Button submit primary>
                     Run Report
                   </Button>
@@ -279,7 +403,6 @@ export default function RestockingReport() {
           </Card>
         </Layout.Section>
 
-        {/* Loading State */}
         {loading && (
           <Layout.Section>
             <Card>
@@ -289,48 +412,53 @@ export default function RestockingReport() {
           </Layout.Section>
         )}
 
-        {/* Results */}
         {data && (
           <Layout.Section>
             <Card>
-              <Text as="h2" variant="headingMd">
-                Results ({data.startDate} → {data.endDate})
-              </Text>
-              <Text>Generated at: {data.timestamp}</Text>
+              <BlockStack gap="300">
+                <Text variant="headingMd">
+                  Results ({data.startDate} → {data.endDate})
+                </Text>
+                <Text>
+                  Generated at: {data.timestamp}
+                  {data.shopTimezone
+                    ? ` (Store timezone: ${data.shopTimezone})`
+                    : ""}
+                </Text>
 
-              <div id="results-table" style={{ marginTop: "1rem" }}>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Product Title</th>
-                      <th>Variant Title</th>
-                      <th>SKU</th>
-                      <th>Vendor</th>
-                      <th>Product Type</th>
-                      <th>Net Items Sold</th>
-                      {data.locationNames.map((loc) => (
-                        <th key={loc}>{loc}</th>
-                      ))}
-                    </tr>
-                  </thead>
-
-                  <tbody>
-                    {data.rows.map((r, i) => (
-                      <tr key={i}>
-                        <td>{r.productTitle}</td>
-                        <td>{r.productVariantTitle}</td>
-                        <td>{r.sku}</td>
-                        <td>{r.vendor}</td>
-                        <td>{r.productType}</td>
-                        <td>{r.netItemsSold}</td>
+                <div style={{ marginTop: "1rem" }}>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Product Title</th>
+                        <th>Variant Title</th>
+                        <th>SKU</th>
+                        <th>Vendor</th>
+                        <th>Product Type</th>
+                        <th>Net Items Sold</th>
                         {data.locationNames.map((loc) => (
-                          <td key={loc}>{r.locations[loc] ?? "-"}</td>
+                          <th key={loc}>{loc}</th>
                         ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      {data.rows.map((r, idx) => (
+                        <tr key={idx}>
+                          <td>{r.productTitle}</td>
+                          <td>{r.productVariantTitle}</td>
+                          <td>{r.sku}</td>
+                          <td>{r.vendor}</td>
+                          <td>{r.productType}</td>
+                          <td>{r.netItemsSold}</td>
+                          {data.locationNames.map((loc) => (
+                            <td key={loc}>{r.locations[loc] ?? "-"}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </BlockStack>
             </Card>
           </Layout.Section>
         )}
