@@ -1,6 +1,6 @@
-client_id = "e782b0b0778fa238926f5d95475225d7"
-name = "Restocking Report Wilmington"
-application_url = "https://restocking-report.onrender.com"
+client_id = "6a38bb4ae709a9300a1919428a55c900"
+name = "Restocking Report Chatanooga"
+application_url = "https://restocking-report-chatanooga.onrender.com"
 embedded = true
 
 [build]
@@ -18,6 +18,6 @@ scopes = "read_orders,read_inventory,read_products,read_locations"
 
 [auth]
 redirect_urls = [
-  "https://restocking-report.onrender.com/auth/callback",
-  "https://restocking-report.onrender.com/auth/shopify/callback"
+  "https://https://restocking-report-chatanooga.onrender.com/auth/callback",
+  "https://https://restocking-report-chatanooga.onrender.com/auth/shopify/callback"
 ]
