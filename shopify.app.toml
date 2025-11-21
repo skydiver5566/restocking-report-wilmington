@@ -18,6 +18,6 @@ scopes = "read_orders,read_inventory,read_products,read_locations"
 
 [auth]
 redirect_urls = [
-  "https://https://restocking-report-chatanooga.onrender.com/auth/callback",
-  "https://https://restocking-report-chatanooga.onrender.com/auth/shopify/callback"
+  "https://restocking-report-chatanooga.onrender.com/auth/callback",
+  "https://restocking-report-chatanooga.onrender.com/auth/shopify/callback"
 ]
