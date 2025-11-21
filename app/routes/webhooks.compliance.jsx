@@ -1,15 +1,15 @@
-import { authenticateWebhook } from "../shopify.server";
+// app/routes/webhooks.compliance.jsx
 
-// Needed because Shopify sends a GET to verify the endpoint during install
 export const loader = () => {
   return new Response("OK", { status: 200 });
 };
 
-// Handles Shopify POST compliance webhooks
-export const action = async ({ request }) => {
+export const action = async ({ request, context }) => {
   try {
-    const { topic, shop } = await authenticateWebhook(request);
+    const { topic, shop } = context.webhook;
+
     console.log("Received compliance webhook:", topic, "from", shop);
+
     return new Response("OK", { status: 200 });
   } catch (error) {
     console.error("Webhook error:", error);
