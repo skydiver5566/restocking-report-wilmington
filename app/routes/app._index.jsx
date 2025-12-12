@@ -294,6 +294,25 @@ export default function RestockingReport() {
 
   return (
     <Page title={`Restocking Report (${shopName})`}>
+      <style>
+        {`
+          table {
+            border-collapse: collapse;
+            width: 100%;
+        }
+        th, td {
+          border: 1px solid #000;
+          padding: 6px;
+          text-align: left;
+          vertical-align: top;
+          word-break: break-word;
+        }
+        th {
+          background: #f2f2f2;
+          font-weight: bold;
+        }
+  `}
+</style>
       <Layout>
         <Layout.Section>
           <Card>
