@@ -120,7 +120,7 @@ export const action = async ({ request }) => {
 
   const SHOP_TZ_QUERY = `
     query {
-      shop { timezone }
+      shop { ianaTimezone }
     }
   `;
 
@@ -130,10 +130,11 @@ export const action = async ({ request }) => {
   try {
     const tzResp = await admin.graphql(SHOP_TZ_QUERY);
     const tzJson = await tzResp.json();
-    const tz = tzJson?.data?.shop?.timezone;
-    if (tz) {
-      storeRailsTz = tz;
-      storeIanaTz = RAILS_TZ_TO_IANA[tz] || "UTC";
+    const iana = tzJson?.data?.shop?.ianaTimezone;
+
+    if (iana && typeof iana === "string") {
+      storeIanaTz = iana;
+      storeRailsTz = iana;
     }
   } catch (err) {
     console.error("Timezone fetch error:", err);
@@ -141,6 +142,21 @@ export const action = async ({ request }) => {
 
   const startUTC = zonedDateTimeToUtc(startDateStr, storeIanaTz);
   const endUTC = zonedDateTimeToUtc(endDateStr, storeIanaTz);
+
+  if (!startUTC || !endUTC) {
+    return {
+      rows: [],
+      locationNames: [],
+      timestamp: new Date().toLocaleString("en-US", {
+        timeZone: storeIanaTz,
+      }),
+      startDate: startDateStr,
+      endDate: endDateStr,
+      shopTimezone: storeRailsTz,
+      error: "Invalid date input",
+    };
+  }
+
   endUTC.setSeconds(59, 999);
 
   const ORDERS_QUERY = `
@@ -213,7 +229,6 @@ export const action = async ({ request }) => {
       const p = n.product;
       const v = n.variant;
 
-      // 🚫 Skip Gift Cards, Donations, and no-SKU items
       if (
         !v?.sku ||
         p?.productType === "Gift Cards" ||
@@ -232,8 +247,6 @@ export const action = async ({ request }) => {
         );
 
         locationNames.add(locName);
-
-        // ✅ Always numeric, never "-"
         locData[locName] = Number.isFinite(available?.quantity)
           ? available.quantity
           : 0;
@@ -299,20 +312,21 @@ export default function RestockingReport() {
           table {
             border-collapse: collapse;
             width: 100%;
-        }
-        th, td {
-          border: 1px solid #000;
-          padding: 6px;
-          text-align: left;
-          vertical-align: top;
-          word-break: break-word;
-        }
-        th {
-          background: #f2f2f2;
-          font-weight: bold;
-        }
-  `}
-</style>
+          }
+          th, td {
+            border: 1px solid #000;
+            padding: 6px;
+            text-align: left;
+            vertical-align: top;
+            word-break: break-word;
+          }
+          th {
+            background: #f2f2f2;
+            font-weight: bold;
+          }
+        `}
+      </style>
+
       <Layout>
         <Layout.Section>
           <Card>
@@ -358,38 +372,48 @@ export default function RestockingReport() {
         {data && (
           <Layout.Section>
             <Card>
-              <div style={{ overflowX: "auto" }}>
-                <table>
-                  <thead>
-                    <tr>
-                      <th>Product</th>
-                      <th>Variant</th>
-                      <th>SKU</th>
-                      <th>Vendor</th>
-                      <th>Type</th>
-                      <th>Net Sold</th>
-                      {data.locationNames.map((l) => (
-                        <th key={l}>{l}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {data.rows.map((r, i) => (
-                      <tr key={i}>
-                        <td>{r.productTitle}</td>
-                        <td>{r.productVariantTitle}</td>
-                        <td>{r.sku}</td>
-                        <td>{r.vendor}</td>
-                        <td>{r.productType}</td>
-                        <td>{r.netItemsSold}</td>
+              <BlockStack gap="200">
+                {/* ✅ TIMESTAMP RESTORED */}
+                <Text>
+                  Generated at: {data.timestamp}
+                  {data.shopTimezone
+                    ? ` (Store timezone: ${data.shopTimezone})`
+                    : ""}
+                </Text>
+
+                <div style={{ overflowX: "auto" }}>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Product</th>
+                        <th>Variant</th>
+                        <th>SKU</th>
+                        <th>Vendor</th>
+                        <th>Type</th>
+                        <th>Net Sold</th>
                         {data.locationNames.map((l) => (
-                          <td key={l}>{r.locations[l] ?? 0}</td>
+                          <th key={l}>{l}</th>
                         ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      {data.rows.map((r, i) => (
+                        <tr key={i}>
+                          <td>{r.productTitle}</td>
+                          <td>{r.productVariantTitle}</td>
+                          <td>{r.sku}</td>
+                          <td>{r.vendor}</td>
+                          <td>{r.productType}</td>
+                          <td>{r.netItemsSold}</td>
+                          {data.locationNames.map((l) => (
+                            <td key={l}>{r.locations[l] ?? 0}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </BlockStack>
             </Card>
           </Layout.Section>
         )}
