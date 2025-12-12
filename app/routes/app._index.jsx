@@ -118,22 +118,26 @@ export const action = async ({ request }) => {
   const startDateStr = formData.get("startDate");
   const endDateStr = formData.get("endDate");
 
+  // ✅ FIX: Shop.timezone doesn't exist (in your API version); use ianaTimezone
   const SHOP_TZ_QUERY = `
     query {
-      shop { timezone }
+      shop { ianaTimezone }
     }
   `;
 
+  // Keep your original defaults (so the report still works even if TZ lookup fails)
   let storeRailsTz = "Eastern Time (US & Canada)";
   let storeIanaTz = "America/New_York";
 
   try {
     const tzResp = await admin.graphql(SHOP_TZ_QUERY);
     const tzJson = await tzResp.json();
-    const tz = tzJson?.data?.shop?.timezone;
-    if (tz) {
-      storeRailsTz = tz;
-      storeIanaTz = RAILS_TZ_TO_IANA[tz] || "UTC";
+    const iana = tzJson?.data?.shop?.ianaTimezone;
+
+    if (iana && typeof iana === "string") {
+      storeIanaTz = iana;
+      // Keep this label field for your UI display (you used "shopTimezone")
+      storeRailsTz = iana;
     }
   } catch (err) {
     console.error("Timezone fetch error:", err);
@@ -299,20 +303,21 @@ export default function RestockingReport() {
           table {
             border-collapse: collapse;
             width: 100%;
-        }
-        th, td {
-          border: 1px solid #000;
-          padding: 6px;
-          text-align: left;
-          vertical-align: top;
-          word-break: break-word;
-        }
-        th {
-          background: #f2f2f2;
-          font-weight: bold;
-        }
-  `}
-</style>
+          }
+          th, td {
+            border: 1px solid #000;
+            padding: 6px;
+            text-align: left;
+            vertical-align: top;
+            word-break: break-word;
+          }
+          th {
+            background: #f2f2f2;
+            font-weight: bold;
+          }
+        `}
+      </style>
+
       <Layout>
         <Layout.Section>
           <Card>
