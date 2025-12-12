@@ -83,8 +83,7 @@ function zonedDateTimeToUtc(datetimeStr, timeZone) {
   );
 
   const offsetMs = localAsIfUtcMs - naiveUtc.getTime();
-  const actualUtcMs = naiveUtc.getTime() - offsetMs;
-  return new Date(actualUtcMs);
+  return new Date(naiveUtc.getTime() - offsetMs);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -96,13 +95,11 @@ export async function loader({ request }) {
 
   const SHOP_NAME_QUERY = `
     query StoreName {
-      shop {
-        name
-      }
+      shop { name }
     }
   `;
 
-  let shopName = session.shop; // fallback to domain
+  let shopName = session.shop;
   try {
     const resp = await admin.graphql(SHOP_NAME_QUERY);
     const json = await resp.json();
@@ -129,9 +126,7 @@ export const action = async ({ request }) => {
 
   const SHOP_TZ_QUERY = `
     query ShopTimezone {
-      shop {
-        timezone
-      }
+      shop { timezone }
     }
   `;
 
@@ -171,12 +166,7 @@ export const action = async ({ request }) => {
 
   const ORDERS_QUERY = `
     query RestockingReportOrders($cursor: String) {
-      orders(
-        first: 50
-        after: $cursor
-        sortKey: CREATED_AT
-        reverse: true
-      ) {
+      orders(first: 50, after: $cursor, sortKey: CREATED_AT, reverse: true) {
         edges {
           cursor
           node {
@@ -221,29 +211,15 @@ export const action = async ({ request }) => {
   while (hasNextPage) {
     const response = await admin.graphql(ORDERS_QUERY, { variables: { cursor } });
     const data = await response.json();
-
     if (data.errors) break;
 
     const connection = data?.data?.orders;
     if (!connection) break;
 
-    const edges = connection.edges || [];
-
-    for (const edge of edges) {
+    for (const edge of connection.edges || []) {
       const createdUTC = new Date(edge.node.createdAt);
       if (createdUTC >= startUTC && createdUTC <= endUTC) {
         allOrders.push(edge);
-      }
-    }
-
-    const cost = data.extensions?.cost;
-    if (cost) {
-      const remaining = cost.throttleStatus.currentlyAvailable;
-      const requested = cost.requestedQueryCost;
-      const restoreRate = cost.throttleStatus.restoreRate;
-
-      if (remaining < requested) {
-        await new Promise((r) => setTimeout(r, restoreRate * 1000));
       }
     }
 
@@ -251,8 +227,7 @@ export const action = async ({ request }) => {
     hasNextPage = connection.pageInfo.hasNextPage;
 
     pageCount++;
-    if (pageCount > 20) break;
-    if (allOrders.length > 500) break;
+    if (pageCount > 20 || allOrders.length > 500) break;
   }
 
   const rawRows = [];
@@ -263,10 +238,12 @@ export const action = async ({ request }) => {
       const n = li.node;
       const p = n.product;
       const v = n.variant;
-      const qty = n.quantity;
 
-      const levels = v?.inventoryItem?.inventoryLevels?.edges || [];
+      // ✅ REMOVE items with no SKU
+      if (!v?.sku) continue;
+
       const locData = {};
+      const levels = v?.inventoryItem?.inventoryLevels?.edges || [];
 
       for (const lvl of levels) {
         const locName = lvl.node.location?.name || "Unknown";
@@ -274,16 +251,20 @@ export const action = async ({ request }) => {
           (q) => q.name === "available"
         );
         locationNames.add(locName);
-        locData[locName] = available ? available.quantity : "-";
+
+        // ✅ Always numeric, never "-"
+        locData[locName] = Number.isFinite(available?.quantity)
+          ? available.quantity
+          : 0;
       }
 
       rawRows.push({
         productTitle: p?.title || "N/A",
         productVariantTitle: v?.title || "N/A",
-        sku: v?.sku || "N/A",
+        sku: v.sku,
         vendor: p?.vendor || "N/A",
         productType: p?.productType || "N/A",
-        netItemsSold: qty,
+        netItemsSold: n.quantity,
         locations: locData,
       });
     }
@@ -294,28 +275,18 @@ export const action = async ({ request }) => {
     const key = `${r.productTitle}||${r.productVariantTitle}||${r.sku}`;
     if (!grouped[key]) {
       grouped[key] = {
-        productTitle: r.productTitle,
-        productVariantTitle: r.productVariantTitle,
-        sku: r.sku,
-        vendor: r.vendor,
-        productType: r.productType,
+        ...r,
         netItemsSold: 0,
         locations: {},
       };
     }
-    grouped[key].netItemsSold += r.netItemsSold;
 
-    for (const loc of Object.keys(r.locations)) {
-      grouped[key].locations[loc] = r.locations[loc];
-    }
+    grouped[key].netItemsSold += r.netItemsSold;
+    Object.assign(grouped[key].locations, r.locations);
   }
 
-  const finalRows = Object.values(grouped).sort((a, b) =>
-    a.sku.localeCompare(b.sku)
-  );
-
   return {
-    rows: finalRows,
+    rows: Object.values(grouped).sort((a, b) => a.sku.localeCompare(b.sku)),
     locationNames: Array.from(locationNames),
     timestamp: new Date().toLocaleString("en-US", {
       timeZone: storeIanaTz,
@@ -386,10 +357,7 @@ export default function RestockingReport() {
                     onChange={setEndDate}
                     required
                   />
-
-                  <Button submit primary>
-                    Run Report
-                  </Button>
+                  <Button submit primary>Run Report</Button>
                 </BlockStack>
               </Form>
             </BlockStack>
@@ -434,7 +402,6 @@ export default function RestockingReport() {
                         ))}
                       </tr>
                     </thead>
-
                     <tbody>
                       {data.rows.map((r, idx) => (
                         <tr key={idx}>
@@ -445,7 +412,7 @@ export default function RestockingReport() {
                           <td>{r.productType}</td>
                           <td>{r.netItemsSold}</td>
                           {data.locationNames.map((loc) => (
-                            <td key={loc}>{r.locations[loc] ?? "-"}</td>
+                            <td key={loc}>{r.locations[loc] ?? 0}</td>
                           ))}
                         </tr>
                       ))}
