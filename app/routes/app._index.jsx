@@ -44,11 +44,15 @@ function zonedDateTimeToUtc(datetimeStr, timeZone) {
   const hour = Number(hourStr);
   const minute = Number(minuteStr);
 
-  if ([year, month, day, hour, minute].some((n) => Number.isNaN(n))) {
+  if (
+    [year, month, day, hour, minute].some(
+      (n) => Number.isNaN(n) || !Number.isFinite(n)
+    )
+  ) {
     return null;
   }
 
-  const naiveUtc = new Date(Date.UTC(year, month - 1, day, hour, minute));
+  const naiveUtc = new Date(Date.UTC(year, month - 1, day, hour, minute, 0, 0));
 
   const dtf = new Intl.DateTimeFormat("en-US", {
     timeZone,
@@ -64,7 +68,9 @@ function zonedDateTimeToUtc(datetimeStr, timeZone) {
   const parts = dtf.formatToParts(naiveUtc);
   const map = {};
   for (const p of parts) {
-    if (p.type !== "literal") map[p.type] = p.value;
+    if (p.type !== "literal") {
+      map[p.type] = p.value;
+    }
   }
 
   const localAsIfUtcMs = Date.UTC(
@@ -77,23 +83,26 @@ function zonedDateTimeToUtc(datetimeStr, timeZone) {
   );
 
   const offsetMs = localAsIfUtcMs - naiveUtc.getTime();
-  return new Date(naiveUtc.getTime() - offsetMs);
+  const actualUtcMs = naiveUtc.getTime() - offsetMs;
+  return new Date(actualUtcMs);
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                   LOADER                                   */
+/*                               LOADER (store name)                          */
 /* -------------------------------------------------------------------------- */
 
 export async function loader({ request }) {
   const { admin, session } = await authenticate.admin(request);
 
   const SHOP_NAME_QUERY = `
-    query {
-      shop { name }
+    query StoreName {
+      shop {
+        name
+      }
     }
   `;
 
-  let shopName = session.shop;
+  let shopName = session.shop; // fallback to domain
   try {
     const resp = await admin.graphql(SHOP_NAME_QUERY);
     const json = await resp.json();
@@ -108,7 +117,7 @@ export async function loader({ request }) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                                   ACTION                                   */
+/*                               SERVER ACTION                                */
 /* -------------------------------------------------------------------------- */
 
 export const action = async ({ request }) => {
@@ -119,8 +128,10 @@ export const action = async ({ request }) => {
   const endDateStr = formData.get("endDate");
 
   const SHOP_TZ_QUERY = `
-    query {
-      shop { ianaTimezone }
+    query ShopTimezone {
+      shop {
+        timezone
+      }
     }
   `;
 
@@ -128,16 +139,15 @@ export const action = async ({ request }) => {
   let storeIanaTz = "America/New_York";
 
   try {
-    const tzResp = await admin.graphql(SHOP_TZ_QUERY);
-    const tzJson = await tzResp.json();
-    const iana = tzJson?.data?.shop?.ianaTimezone;
-
-    if (iana && typeof iana === "string") {
-      storeIanaTz = iana;
-      storeRailsTz = iana;
+    const shopResp = await admin.graphql(SHOP_TZ_QUERY);
+    const shopJson = await shopResp.json();
+    const tz = shopJson?.data?.shop?.timezone;
+    if (tz && typeof tz === "string") {
+      storeRailsTz = tz;
+      storeIanaTz = RAILS_TZ_TO_IANA[tz] || "UTC";
     }
   } catch (err) {
-    console.error("Timezone fetch error:", err);
+    console.error("Error fetching shop timezone:", err);
   }
 
   const startUTC = zonedDateTimeToUtc(startDateStr, storeIanaTz);
@@ -152,8 +162,8 @@ export const action = async ({ request }) => {
       }),
       startDate: startDateStr,
       endDate: endDateStr,
-      shopTimezone: storeRailsTz,
       error: "Invalid date input",
+      shopTimezone: storeRailsTz,
     };
   }
 
@@ -161,7 +171,12 @@ export const action = async ({ request }) => {
 
   const ORDERS_QUERY = `
     query RestockingReportOrders($cursor: String) {
-      orders(first: 50, after: $cursor, sortKey: CREATED_AT, reverse: true) {
+      orders(
+        first: 50
+        after: $cursor
+        sortKey: CREATED_AT
+        reverse: true
+      ) {
         edges {
           cursor
           node {
@@ -204,20 +219,40 @@ export const action = async ({ request }) => {
   let pageCount = 0;
 
   while (hasNextPage) {
-    const resp = await admin.graphql(ORDERS_QUERY, { variables: { cursor } });
-    const json = await resp.json();
-    if (json.errors) break;
+    const response = await admin.graphql(ORDERS_QUERY, { variables: { cursor } });
+    const data = await response.json();
 
-    const orders = json?.data?.orders;
-    if (!orders) break;
+    if (data.errors) break;
 
-    allOrders.push(...orders.edges);
+    const connection = data?.data?.orders;
+    if (!connection) break;
 
-    cursor = orders.pageInfo.endCursor;
-    hasNextPage = orders.pageInfo.hasNextPage;
+    const edges = connection.edges || [];
+
+    for (const edge of edges) {
+      const createdUTC = new Date(edge.node.createdAt);
+      if (createdUTC >= startUTC && createdUTC <= endUTC) {
+        allOrders.push(edge);
+      }
+    }
+
+    const cost = data.extensions?.cost;
+    if (cost) {
+      const remaining = cost.throttleStatus.currentlyAvailable;
+      const requested = cost.requestedQueryCost;
+      const restoreRate = cost.throttleStatus.restoreRate;
+
+      if (remaining < requested) {
+        await new Promise((r) => setTimeout(r, restoreRate * 1000));
+      }
+    }
+
+    cursor = connection.pageInfo.endCursor;
+    hasNextPage = connection.pageInfo.hasNextPage;
 
     pageCount++;
     if (pageCount > 20) break;
+    if (allOrders.length > 500) break;
   }
 
   const rawRows = [];
@@ -228,28 +263,18 @@ export const action = async ({ request }) => {
       const n = li.node;
       const p = n.product;
       const v = n.variant;
+      const qty = n.quantity;
 
-      if (
-        !v?.sku ||
-        p?.productType === "Gift Cards" ||
-        p?.productType === "Donations"
-      ) {
-        continue;
-      }
-
-      const locData = {};
       const levels = v?.inventoryItem?.inventoryLevels?.edges || [];
+      const locData = {};
 
       for (const lvl of levels) {
         const locName = lvl.node.location?.name || "Unknown";
         const available = lvl.node.quantities?.find(
           (q) => q.name === "available"
         );
-
         locationNames.add(locName);
-        locData[locName] = Number.isFinite(available?.quantity)
-          ? available.quantity
-          : 0;
+        locData[locName] = available ? available.quantity : "-";
       }
 
       rawRows.push({
@@ -258,7 +283,7 @@ export const action = async ({ request }) => {
         sku: v?.sku || "N/A",
         vendor: p?.vendor || "N/A",
         productType: p?.productType || "N/A",
-        netItemsSold: n.quantity,
+        netItemsSold: qty,
         locations: locData,
       });
     }
@@ -269,18 +294,28 @@ export const action = async ({ request }) => {
     const key = `${r.productTitle}||${r.productVariantTitle}||${r.sku}`;
     if (!grouped[key]) {
       grouped[key] = {
-        ...r,
+        productTitle: r.productTitle,
+        productVariantTitle: r.productVariantTitle,
+        sku: r.sku,
+        vendor: r.vendor,
+        productType: r.productType,
         netItemsSold: 0,
         locations: {},
       };
     }
-
     grouped[key].netItemsSold += r.netItemsSold;
-    Object.assign(grouped[key].locations, r.locations);
+
+    for (const loc of Object.keys(r.locations)) {
+      grouped[key].locations[loc] = r.locations[loc];
+    }
   }
 
+  const finalRows = Object.values(grouped).sort((a, b) =>
+    a.sku.localeCompare(b.sku)
+  );
+
   return {
-    rows: Object.values(grouped),
+    rows: finalRows,
     locationNames: Array.from(locationNames),
     timestamp: new Date().toLocaleString("en-US", {
       timeZone: storeIanaTz,
@@ -292,7 +327,7 @@ export const action = async ({ request }) => {
 };
 
 /* -------------------------------------------------------------------------- */
-/*                                 COMPONENT                                  */
+/*                           CLIENT-SIDE COMPONENT                            */
 /* -------------------------------------------------------------------------- */
 
 export default function RestockingReport() {
@@ -330,7 +365,7 @@ export default function RestockingReport() {
       <Layout>
         <Layout.Section>
           <Card>
-            <BlockStack gap="300">
+            <BlockStack gap="400">
               <Text variant="headingLg">Restocking Report</Text>
 
               <Form method="post">
@@ -351,6 +386,7 @@ export default function RestockingReport() {
                     onChange={setEndDate}
                     required
                   />
+
                   <Button submit primary>
                     Run Report
                   </Button>
@@ -372,8 +408,10 @@ export default function RestockingReport() {
         {data && (
           <Layout.Section>
             <Card>
-              <BlockStack gap="200">
-                {/* ✅ TIMESTAMP RESTORED */}
+              <BlockStack gap="300">
+                <Text variant="headingMd">
+                  Results ({data.startDate} → {data.endDate})
+                </Text>
                 <Text>
                   Generated at: {data.timestamp}
                   {data.shopTimezone
@@ -381,32 +419,33 @@ export default function RestockingReport() {
                     : ""}
                 </Text>
 
-                <div style={{ overflowX: "auto" }}>
+                <div style={{ marginTop: "1rem" }}>
                   <table>
                     <thead>
                       <tr>
-                        <th>Product</th>
-                        <th>Variant</th>
+                        <th>Product Title</th>
+                        <th>Variant Title</th>
                         <th>SKU</th>
                         <th>Vendor</th>
-                        <th>Type</th>
-                        <th>Net Sold</th>
-                        {data.locationNames.map((l) => (
-                          <th key={l}>{l}</th>
+                        <th>Product Type</th>
+                        <th>Net Items Sold</th>
+                        {data.locationNames.map((loc) => (
+                          <th key={loc}>{loc}</th>
                         ))}
                       </tr>
                     </thead>
+
                     <tbody>
-                      {data.rows.map((r, i) => (
-                        <tr key={i}>
+                      {data.rows.map((r, idx) => (
+                        <tr key={idx}>
                           <td>{r.productTitle}</td>
                           <td>{r.productVariantTitle}</td>
                           <td>{r.sku}</td>
                           <td>{r.vendor}</td>
                           <td>{r.productType}</td>
                           <td>{r.netItemsSold}</td>
-                          {data.locationNames.map((l) => (
-                            <td key={l}>{r.locations[l] ?? 0}</td>
+                          {data.locationNames.map((loc) => (
+                            <td key={loc}>{r.locations[loc] ?? "-"}</td>
                           ))}
                         </tr>
                       ))}
