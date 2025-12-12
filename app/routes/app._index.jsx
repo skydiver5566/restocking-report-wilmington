@@ -19,8 +19,15 @@ import {
 import { authenticate } from "../shopify.server";
 
 /* -------------------------------------------------------------------------- */
-/*                    Helper: Convert a store-local datetime → UTC             */
+/*                             Helper: TZ Mapping                             */
 /* -------------------------------------------------------------------------- */
+
+const RAILS_TZ_TO_IANA = {
+  "Eastern Time (US & Canada)": "America/New_York",
+  "Central Time (US & Canada)": "America/Chicago",
+  "Mountain Time (US & Canada)": "America/Denver",
+  "Pacific Time (US & Canada)": "America/Los_Angeles",
+};
 
 function zonedDateTimeToUtc(datetimeStr, timeZone) {
   if (!datetimeStr) return null;
@@ -37,15 +44,11 @@ function zonedDateTimeToUtc(datetimeStr, timeZone) {
   const hour = Number(hourStr);
   const minute = Number(minuteStr);
 
-  if (
-    [year, month, day, hour, minute].some(
-      (n) => Number.isNaN(n) || !Number.isFinite(n)
-    )
-  ) {
+  if ([year, month, day, hour, minute].some((n) => Number.isNaN(n))) {
     return null;
   }
 
-  const naiveUtc = new Date(Date.UTC(year, month - 1, day, hour, minute, 0, 0));
+  const naiveUtc = new Date(Date.UTC(year, month - 1, day, hour, minute));
 
   const dtf = new Intl.DateTimeFormat("en-US", {
     timeZone,
@@ -61,9 +64,7 @@ function zonedDateTimeToUtc(datetimeStr, timeZone) {
   const parts = dtf.formatToParts(naiveUtc);
   const map = {};
   for (const p of parts) {
-    if (p.type !== "literal") {
-      map[p.type] = p.value;
-    }
+    if (p.type !== "literal") map[p.type] = p.value;
   }
 
   const localAsIfUtcMs = Date.UTC(
@@ -76,35 +77,26 @@ function zonedDateTimeToUtc(datetimeStr, timeZone) {
   );
 
   const offsetMs = localAsIfUtcMs - naiveUtc.getTime();
-  const actualUtcMs = naiveUtc.getTime() - offsetMs;
-  return new Date(actualUtcMs);
+  return new Date(naiveUtc.getTime() - offsetMs);
 }
 
 /* -------------------------------------------------------------------------- */
-/*                               LOADER (store name)                          */
+/*                                   LOADER                                   */
 /* -------------------------------------------------------------------------- */
 
 export async function loader({ request }) {
   const { admin, session } = await authenticate.admin(request);
 
   const SHOP_NAME_QUERY = `
-    query StoreName {
-      shop {
-        name
-      }
+    query {
+      shop { name }
     }
   `;
 
-  let shopName = session.shop; // fallback to domain
+  let shopName = session.shop;
   try {
     const resp = await admin.graphql(SHOP_NAME_QUERY);
     const json = await resp.json();
-    if (json?.errors) {
-      console.error(
-        "Store name GraphQL errors:",
-        JSON.stringify(json.errors, null, 2)
-      );
-    }
     if (json?.data?.shop?.name) {
       shopName = json.data.shop.name;
     }
@@ -116,7 +108,7 @@ export async function loader({ request }) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*                               SERVER ACTION                                */
+/*                                   ACTION                                   */
 /* -------------------------------------------------------------------------- */
 
 export const action = async ({ request }) => {
@@ -126,61 +118,34 @@ export const action = async ({ request }) => {
   const startDateStr = formData.get("startDate");
   const endDateStr = formData.get("endDate");
 
-  // ✅ FIX: Use ianaTimezone (valid) instead of shop.timezone (invalid)
   const SHOP_TZ_QUERY = `
-    query ShopTimezone {
-      shop {
-        ianaTimezone
-      }
+    query {
+      shop { timezone }
     }
   `;
 
+  let storeRailsTz = "Eastern Time (US & Canada)";
   let storeIanaTz = "America/New_York";
 
   try {
-    const shopResp = await admin.graphql(SHOP_TZ_QUERY);
-    const shopJson = await shopResp.json();
-
-    if (shopJson?.errors) {
-      console.error(
-        "Shop timezone GraphQL errors:",
-        JSON.stringify(shopJson.errors, null, 2)
-      );
-    }
-
-    const iana = shopJson?.data?.shop?.ianaTimezone;
-    if (iana && typeof iana === "string") {
-      storeIanaTz = iana;
+    const tzResp = await admin.graphql(SHOP_TZ_QUERY);
+    const tzJson = await tzResp.json();
+    const tz = tzJson?.data?.shop?.timezone;
+    if (tz) {
+      storeRailsTz = tz;
+      storeIanaTz = RAILS_TZ_TO_IANA[tz] || "UTC";
     }
   } catch (err) {
-    console.error("Error fetching shop timezone:", err);
+    console.error("Timezone fetch error:", err);
   }
 
   const startUTC = zonedDateTimeToUtc(startDateStr, storeIanaTz);
   const endUTC = zonedDateTimeToUtc(endDateStr, storeIanaTz);
-
-  if (!startUTC || !endUTC) {
-    return {
-      rows: [],
-      locationNames: [],
-      timestamp: new Date().toLocaleString("en-US", { timeZone: storeIanaTz }),
-      startDate: startDateStr,
-      endDate: endDateStr,
-      error: "Invalid date input",
-      shopTimezone: storeIanaTz,
-    };
-  }
-
   endUTC.setSeconds(59, 999);
 
   const ORDERS_QUERY = `
     query RestockingReportOrders($cursor: String) {
-      orders(
-        first: 50
-        after: $cursor
-        sortKey: CREATED_AT
-        reverse: true
-      ) {
+      orders(first: 50, after: $cursor, sortKey: CREATED_AT, reverse: true) {
         edges {
           cursor
           node {
@@ -223,48 +188,20 @@ export const action = async ({ request }) => {
   let pageCount = 0;
 
   while (hasNextPage) {
-    const response = await admin.graphql(ORDERS_QUERY, {
-      variables: { cursor },
-    });
-    const data = await response.json();
+    const resp = await admin.graphql(ORDERS_QUERY, { variables: { cursor } });
+    const json = await resp.json();
+    if (json.errors) break;
 
-    if (data?.errors) {
-      console.error(
-        "Orders GraphQL errors:",
-        JSON.stringify(data.errors, null, 2)
-      );
-      break;
-    }
+    const orders = json?.data?.orders;
+    if (!orders) break;
 
-    const connection = data?.data?.orders;
-    if (!connection) break;
+    allOrders.push(...orders.edges);
 
-    const edges = connection.edges || [];
-
-    for (const edge of edges) {
-      const createdUTC = new Date(edge.node.createdAt);
-      if (createdUTC >= startUTC && createdUTC <= endUTC) {
-        allOrders.push(edge);
-      }
-    }
-
-    const cost = data.extensions?.cost;
-    if (cost) {
-      const remaining = cost.throttleStatus.currentlyAvailable;
-      const requested = cost.requestedQueryCost;
-      const restoreRate = cost.throttleStatus.restoreRate;
-
-      if (remaining < requested) {
-        await new Promise((r) => setTimeout(r, restoreRate * 1000));
-      }
-    }
-
-    cursor = connection.pageInfo.endCursor;
-    hasNextPage = connection.pageInfo.hasNextPage;
+    cursor = orders.pageInfo.endCursor;
+    hasNextPage = orders.pageInfo.hasNextPage;
 
     pageCount++;
     if (pageCount > 20) break;
-    if (allOrders.length > 500) break;
   }
 
   const rawRows = [];
@@ -275,18 +212,31 @@ export const action = async ({ request }) => {
       const n = li.node;
       const p = n.product;
       const v = n.variant;
-      const qty = n.quantity;
 
-      const levels = v?.inventoryItem?.inventoryLevels?.edges || [];
+      // 🚫 Skip Gift Cards, Donations, and no-SKU items
+      if (
+        !v?.sku ||
+        p?.productType === "Gift Cards" ||
+        p?.productType === "Donations"
+      ) {
+        continue;
+      }
+
       const locData = {};
+      const levels = v?.inventoryItem?.inventoryLevels?.edges || [];
 
       for (const lvl of levels) {
         const locName = lvl.node.location?.name || "Unknown";
         const available = lvl.node.quantities?.find(
           (q) => q.name === "available"
         );
+
         locationNames.add(locName);
-        locData[locName] = available ? available.quantity : "-";
+
+        // ✅ Always numeric, never "-"
+        locData[locName] = Number.isFinite(available?.quantity)
+          ? available.quantity
+          : 0;
       }
 
       rawRows.push({
@@ -295,7 +245,7 @@ export const action = async ({ request }) => {
         sku: v?.sku || "N/A",
         vendor: p?.vendor || "N/A",
         productType: p?.productType || "N/A",
-        netItemsSold: qty,
+        netItemsSold: n.quantity,
         locations: locData,
       });
     }
@@ -306,38 +256,30 @@ export const action = async ({ request }) => {
     const key = `${r.productTitle}||${r.productVariantTitle}||${r.sku}`;
     if (!grouped[key]) {
       grouped[key] = {
-        productTitle: r.productTitle,
-        productVariantTitle: r.productVariantTitle,
-        sku: r.sku,
-        vendor: r.vendor,
-        productType: r.productType,
+        ...r,
         netItemsSold: 0,
         locations: {},
       };
     }
-    grouped[key].netItemsSold += r.netItemsSold;
 
-    for (const loc of Object.keys(r.locations)) {
-      grouped[key].locations[loc] = r.locations[loc];
-    }
+    grouped[key].netItemsSold += r.netItemsSold;
+    Object.assign(grouped[key].locations, r.locations);
   }
 
-  const finalRows = Object.values(grouped).sort((a, b) =>
-    a.sku.localeCompare(b.sku)
-  );
-
   return {
-    rows: finalRows,
+    rows: Object.values(grouped),
     locationNames: Array.from(locationNames),
-    timestamp: new Date().toLocaleString("en-US", { timeZone: storeIanaTz }),
+    timestamp: new Date().toLocaleString("en-US", {
+      timeZone: storeIanaTz,
+    }),
     startDate: startDateStr,
     endDate: endDateStr,
-    shopTimezone: storeIanaTz,
+    shopTimezone: storeRailsTz,
   };
 };
 
 /* -------------------------------------------------------------------------- */
-/*                           CLIENT-SIDE COMPONENT                            */
+/*                                 COMPONENT                                  */
 /* -------------------------------------------------------------------------- */
 
 export default function RestockingReport() {
@@ -352,30 +294,10 @@ export default function RestockingReport() {
 
   return (
     <Page title={`Restocking Report (${shopName})`}>
-      <style>
-        {`
-          table {
-            border-collapse: collapse;
-            width: 100%;
-          }
-          th, td {
-            border: 1px solid #000;
-            padding: 6px;
-            text-align: left;
-            vertical-align: top;
-            word-break: break-word;
-          }
-          th {
-            background: #f2f2f2;
-            font-weight: bold;
-          }
-        `}
-      </style>
-
       <Layout>
         <Layout.Section>
           <Card>
-            <BlockStack gap="400">
+            <BlockStack gap="300">
               <Text variant="headingLg">Restocking Report</Text>
 
               <Form method="post">
@@ -396,7 +318,6 @@ export default function RestockingReport() {
                     onChange={setEndDate}
                     required
                   />
-
                   <Button submit primary>
                     Run Report
                   </Button>
@@ -418,56 +339,38 @@ export default function RestockingReport() {
         {data && (
           <Layout.Section>
             <Card>
-              <BlockStack gap="300">
-                <Text variant="headingMd">
-                  Results ({data.startDate} → {data.endDate})
-                </Text>
-
-                <Text>
-                  Generated at: {data.timestamp}
-                  {data.shopTimezone ? ` (Store timezone: ${data.shopTimezone})` : ""}
-                </Text>
-
-                {data.error && (
-                  <Text tone="critical">
-                    {data.error}
-                  </Text>
-                )}
-
-                <div style={{ marginTop: "1rem" }}>
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>Product Title</th>
-                        <th>Variant Title</th>
-                        <th>SKU</th>
-                        <th>Vendor</th>
-                        <th>Product Type</th>
-                        <th>Net Items Sold</th>
-                        {data.locationNames.map((loc) => (
-                          <th key={loc}>{loc}</th>
+              <div style={{ overflowX: "auto" }}>
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Product</th>
+                      <th>Variant</th>
+                      <th>SKU</th>
+                      <th>Vendor</th>
+                      <th>Type</th>
+                      <th>Net Sold</th>
+                      {data.locationNames.map((l) => (
+                        <th key={l}>{l}</th>
+                      ))}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.rows.map((r, i) => (
+                      <tr key={i}>
+                        <td>{r.productTitle}</td>
+                        <td>{r.productVariantTitle}</td>
+                        <td>{r.sku}</td>
+                        <td>{r.vendor}</td>
+                        <td>{r.productType}</td>
+                        <td>{r.netItemsSold}</td>
+                        {data.locationNames.map((l) => (
+                          <td key={l}>{r.locations[l] ?? 0}</td>
                         ))}
                       </tr>
-                    </thead>
-
-                    <tbody>
-                      {data.rows.map((r, idx) => (
-                        <tr key={idx}>
-                          <td>{r.productTitle}</td>
-                          <td>{r.productVariantTitle}</td>
-                          <td>{r.sku}</td>
-                          <td>{r.vendor}</td>
-                          <td>{r.productType}</td>
-                          <td>{r.netItemsSold}</td>
-                          {data.locationNames.map((loc) => (
-                            <td key={loc}>{r.locations[loc] ?? "-"}</td>
-                          ))}
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </BlockStack>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </Card>
           </Layout.Section>
         )}
