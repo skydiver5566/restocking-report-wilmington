@@ -19,15 +19,8 @@ import {
 import { authenticate } from "../shopify.server";
 
 /* -------------------------------------------------------------------------- */
-/*                             Helper: TZ Mapping                             */
+/*                    Helper: Convert a store-local datetime → UTC             */
 /* -------------------------------------------------------------------------- */
-
-const RAILS_TZ_TO_IANA = {
-  "Eastern Time (US & Canada)": "America/New_York",
-  "Central Time (US & Canada)": "America/Chicago",
-  "Mountain Time (US & Canada)": "America/Denver",
-  "Pacific Time (US & Canada)": "America/Los_Angeles",
-};
 
 function zonedDateTimeToUtc(datetimeStr, timeZone) {
   if (!datetimeStr) return null;
@@ -106,6 +99,12 @@ export async function loader({ request }) {
   try {
     const resp = await admin.graphql(SHOP_NAME_QUERY);
     const json = await resp.json();
+    if (json?.errors) {
+      console.error(
+        "Store name GraphQL errors:",
+        JSON.stringify(json.errors, null, 2)
+      );
+    }
     if (json?.data?.shop?.name) {
       shopName = json.data.shop.name;
     }
@@ -127,24 +126,31 @@ export const action = async ({ request }) => {
   const startDateStr = formData.get("startDate");
   const endDateStr = formData.get("endDate");
 
+  // ✅ FIX: Use ianaTimezone (valid) instead of shop.timezone (invalid)
   const SHOP_TZ_QUERY = `
     query ShopTimezone {
       shop {
-        timezone
+        ianaTimezone
       }
     }
   `;
 
-  let storeRailsTz = "Eastern Time (US & Canada)";
   let storeIanaTz = "America/New_York";
 
   try {
     const shopResp = await admin.graphql(SHOP_TZ_QUERY);
     const shopJson = await shopResp.json();
-    const tz = shopJson?.data?.shop?.timezone;
-    if (tz && typeof tz === "string") {
-      storeRailsTz = tz;
-      storeIanaTz = RAILS_TZ_TO_IANA[tz] || "UTC";
+
+    if (shopJson?.errors) {
+      console.error(
+        "Shop timezone GraphQL errors:",
+        JSON.stringify(shopJson.errors, null, 2)
+      );
+    }
+
+    const iana = shopJson?.data?.shop?.ianaTimezone;
+    if (iana && typeof iana === "string") {
+      storeIanaTz = iana;
     }
   } catch (err) {
     console.error("Error fetching shop timezone:", err);
@@ -157,13 +163,11 @@ export const action = async ({ request }) => {
     return {
       rows: [],
       locationNames: [],
-      timestamp: new Date().toLocaleString("en-US", {
-        timeZone: storeIanaTz,
-      }),
+      timestamp: new Date().toLocaleString("en-US", { timeZone: storeIanaTz }),
       startDate: startDateStr,
       endDate: endDateStr,
       error: "Invalid date input",
-      shopTimezone: storeRailsTz,
+      shopTimezone: storeIanaTz,
     };
   }
 
@@ -219,10 +223,18 @@ export const action = async ({ request }) => {
   let pageCount = 0;
 
   while (hasNextPage) {
-    const response = await admin.graphql(ORDERS_QUERY, { variables: { cursor } });
+    const response = await admin.graphql(ORDERS_QUERY, {
+      variables: { cursor },
+    });
     const data = await response.json();
 
-    if (data.errors) break;
+    if (data?.errors) {
+      console.error(
+        "Orders GraphQL errors:",
+        JSON.stringify(data.errors, null, 2)
+      );
+      break;
+    }
 
     const connection = data?.data?.orders;
     if (!connection) break;
@@ -317,12 +329,10 @@ export const action = async ({ request }) => {
   return {
     rows: finalRows,
     locationNames: Array.from(locationNames),
-    timestamp: new Date().toLocaleString("en-US", {
-      timeZone: storeIanaTz,
-    }),
+    timestamp: new Date().toLocaleString("en-US", { timeZone: storeIanaTz }),
     startDate: startDateStr,
     endDate: endDateStr,
-    shopTimezone: storeRailsTz,
+    shopTimezone: storeIanaTz,
   };
 };
 
@@ -412,12 +422,17 @@ export default function RestockingReport() {
                 <Text variant="headingMd">
                   Results ({data.startDate} → {data.endDate})
                 </Text>
+
                 <Text>
                   Generated at: {data.timestamp}
-                  {data.shopTimezone
-                    ? ` (Store timezone: ${data.shopTimezone})`
-                    : ""}
+                  {data.shopTimezone ? ` (Store timezone: ${data.shopTimezone})` : ""}
                 </Text>
+
+                {data.error && (
+                  <Text tone="critical">
+                    {data.error}
+                  </Text>
+                )}
 
                 <div style={{ marginTop: "1rem" }}>
                   <table>
