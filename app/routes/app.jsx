@@ -16,7 +16,10 @@ export default function App() {
   return (
     <AppProvider embedded apiKey={apiKey}>
       <s-app-nav>
-        <s-link href="/app/markdown-report">Markdown Report</s-link>
+        
+        // TODO: Markdown report disabled temporarily    
+        // <s-link href="/app/markdown-report">Markdown Report</s-link>
+        
       </s-app-nav>
       <Outlet />
     </AppProvider>
