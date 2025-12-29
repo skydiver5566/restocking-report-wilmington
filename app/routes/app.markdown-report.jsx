@@ -123,7 +123,7 @@ function mergeSalesMap(existingJson, ordersEdges) {
 async function fetchOrdersChunk(admin, sinceISO, afterCursor) {
   const query = `
     query OrdersSince($q: String!, $after: String) {
-      orders(first: 25, after: $after, query: $q, sortKey: CREATED_AT) {
+      orders(first: 50, after: $after, query: $q, sortKey: CREATED_AT) {
         edges {
           cursor
           node {
@@ -450,14 +450,20 @@ async function continueReportRun(admin, shopDomain, runId) {
 
   const startedAt = Date.now();
 
-  // ✅ Keep under typical proxy/client timeouts
-  const MAX_MS = 6500;
+  // ✅ keep each POST short (embedded/proxy friendly)
+  const MAX_MS = 3500;
+
+  // ✅ hard cap the number of Shopify GraphQL calls per request
+  const MAX_LOOPS = 4;
+  let loops = 0;
 
   let cursor = run.cursor;
   let processedOrders = Number(run.processedOrders ?? 0);
   let salesByVariant = run.salesByVariant;
 
-  while (Date.now() - startedAt < MAX_MS) {
+  while (Date.now() - startedAt < MAX_MS && loops < MAX_LOOPS) {
+    loops += 1;
+
     const chunk = await fetchOrdersChunk(admin, run.sinceISO, cursor);
     salesByVariant = mergeSalesMap(salesByVariant, chunk.edges);
     processedOrders += chunk.edges.length;
@@ -476,7 +482,7 @@ async function continueReportRun(admin, shopDomain, runId) {
       return { ...doneRun, progressMessage: "Report scan complete." };
     }
 
-    await sleep(150);
+    await sleep(120);
   }
 
   const latest = await prisma.reportRunState.findUnique({ where: { id: runId } });
@@ -609,7 +615,10 @@ export async function action({ request }) {
 
       log("before fetchAllActiveVariants()", msSince(t0));
       const allVariantsResult = await fetchAllActiveVariants(admin);
-      log("after fetchAllActiveVariants()", msSince(t0), { variants: allVariantsResult.variants?.length ?? 0, truncated: allVariantsResult.truncated });
+      log("after fetchAllActiveVariants()", msSince(t0), {
+        variants: allVariantsResult.variants?.length ?? 0,
+        truncated: allVariantsResult.truncated,
+      });
 
       const wantedSkus = [];
       for (const v of allVariantsResult.variants) {
@@ -785,7 +794,7 @@ export default function MarkdownReport() {
         },
         { method: "post", action: actionUrl }
       );
-    }, 900);
+    }, 350); // ✅ faster polling with short server chunks
 
     return () => clearTimeout(t);
   }, [reportFetcher.data, reportFetcher.state, reportFetcher, currentInputs, actionUrl]);
