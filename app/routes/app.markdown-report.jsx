@@ -1,5 +1,11 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { Form, useActionData, useNavigation, useFetcher } from "react-router";
+import {
+  Form,
+  useActionData,
+  useNavigation,
+  useFetcher,
+  useLocation,
+} from "react-router";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 
@@ -50,7 +56,8 @@ async function adminGraphql(admin, query, variables) {
 ========================= */
 
 function mergeSalesMap(existingJson, ordersEdges) {
-  const sales = (existingJson && typeof existingJson === "object") ? existingJson : {};
+  const sales =
+    existingJson && typeof existingJson === "object" ? existingJson : {};
 
   for (const edge of ordersEdges ?? []) {
     const createdAt = edge?.node?.createdAt;
@@ -69,13 +76,20 @@ function mergeSalesMap(existingJson, ordersEdges) {
         };
       }
 
-      sales[variantId].qtySold = Number(sales[variantId].qtySold ?? 0) + Number(qty ?? 0);
+      sales[variantId].qtySold =
+        Number(sales[variantId].qtySold ?? 0) + Number(qty ?? 0);
 
       if (createdAt) {
-        if (!sales[variantId].firstSoldDate || createdAt < sales[variantId].firstSoldDate) {
+        if (
+          !sales[variantId].firstSoldDate ||
+          createdAt < sales[variantId].firstSoldDate
+        ) {
           sales[variantId].firstSoldDate = createdAt;
         }
-        if (!sales[variantId].lastSoldDate || createdAt > sales[variantId].lastSoldDate) {
+        if (
+          !sales[variantId].lastSoldDate ||
+          createdAt > sales[variantId].lastSoldDate
+        ) {
           sales[variantId].lastSoldDate = createdAt;
         }
       }
@@ -221,9 +235,7 @@ async function fetchStockyPurchaseOrdersPage({ shopDomain, stockyApiKey, limit, 
 
       if (attempt === MAX_RETRIES) {
         throw new Error(
-          `Stocky API error (429): rate limited. Retried ${MAX_RETRIES + 1} times. Try again in ~${Math.ceil(
-            waitMs / 1000
-          )}s.`
+          `Stocky API error (429): rate limited. Retried ${MAX_RETRIES + 1} times.`
         );
       }
 
@@ -341,14 +353,7 @@ async function runFullSyncChunk({ shopDomain, stockyApiKey, startFresh }) {
 
   const state = await getOrCreateSyncState(shopDomain);
   if (state.fullDone) {
-    return {
-      done: true,
-      offset: state.fullOffset,
-      scannedOrders: 0,
-      itemsProcessed: 0,
-      message: "Full Sync already complete.",
-      suggestedNextPollMs: 0,
-    };
+    return { done: true, offset: state.fullOffset, scannedOrders: 0, itemsProcessed: 0, message: "Full Sync already complete.", suggestedNextPollMs: 0 };
   }
 
   const startedAt = Date.now();
@@ -371,14 +376,7 @@ async function runFullSyncChunk({ shopDomain, stockyApiKey, startFresh }) {
         where: { shop: shopDomain },
         data: { fullDone: true },
       });
-      return {
-        done: true,
-        offset,
-        scannedOrders,
-        itemsProcessed,
-        message: "Full Sync complete.",
-        suggestedNextPollMs: 0,
-      };
+      return { done: true, offset, scannedOrders, itemsProcessed, message: "Full Sync complete.", suggestedNextPollMs: 0 };
     }
 
     scannedOrders += orders.length;
@@ -406,27 +404,13 @@ async function runFullSyncChunk({ shopDomain, stockyApiKey, startFresh }) {
         where: { shop: shopDomain },
         data: { fullDone: true },
       });
-      return {
-        done: true,
-        offset,
-        scannedOrders,
-        itemsProcessed,
-        message: "Full Sync complete.",
-        suggestedNextPollMs: 0,
-      };
+      return { done: true, offset, scannedOrders, itemsProcessed, message: "Full Sync complete.", suggestedNextPollMs: 0 };
     }
 
     await sleep(PAGE_DELAY_MS);
   }
 
-  return {
-    done: false,
-    offset,
-    scannedOrders,
-    itemsProcessed,
-    message: "Full Sync in progress…",
-    suggestedNextPollMs: 1400,
-  };
+  return { done: false, offset, scannedOrders, itemsProcessed, message: "Full Sync in progress…", suggestedNextPollMs: 1400 };
 }
 
 /* =========================
@@ -434,7 +418,6 @@ async function runFullSyncChunk({ shopDomain, stockyApiKey, startFresh }) {
 ========================= */
 
 async function cleanupOldRuns(shopDomain) {
-  // keep last ~2 days
   const cutoff = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
   await prisma.reportRunState.deleteMany({
     where: { shop: shopDomain, createdAt: { lt: cutoff } },
@@ -443,10 +426,9 @@ async function cleanupOldRuns(shopDomain) {
 
 async function startReportRun(shopDomain, periodQtySoldLTE, lookBackDays) {
   await cleanupOldRuns(shopDomain);
-
   const sinceISO = new Date(Date.now() - lookBackDays * 86400000).toISOString();
 
-  const run = await prisma.reportRunState.create({
+  return prisma.reportRunState.create({
     data: {
       shop: shopDomain,
       periodQtySoldLTE,
@@ -460,22 +442,17 @@ async function startReportRun(shopDomain, periodQtySoldLTE, lookBackDays) {
       error: null,
     },
   });
-
-  return run;
 }
 
 async function continueReportRun(admin, shopDomain, runId) {
   const run = await prisma.reportRunState.findUnique({ where: { id: runId } });
   if (!run || run.shop !== shopDomain) throw new Error("Report run not found.");
-  if (run.done || run.status === "done") {
-    return { ...run, progressMessage: "Report scan complete." };
-  }
-  if (run.status === "error") {
-    throw new Error(run.error || "Report run previously failed.");
-  }
+  if (run.done || run.status === "done") return { ...run, progressMessage: "Report scan complete." };
+  if (run.status === "error") throw new Error(run.error || "Report run previously failed.");
 
   const startedAt = Date.now();
-  const MAX_MS = 12000; // keep each chunk short
+  const MAX_MS = 12000;
+
   let cursor = run.cursor;
   let processedOrders = Number(run.processedOrders ?? 0);
   let salesByVariant = run.salesByVariant;
@@ -483,21 +460,12 @@ async function continueReportRun(admin, shopDomain, runId) {
   while (Date.now() - startedAt < MAX_MS) {
     const chunk = await fetchOrdersChunk(admin, run.sinceISO, cursor);
     salesByVariant = mergeSalesMap(salesByVariant, chunk.edges);
-
     processedOrders += chunk.edges.length;
-
     cursor = chunk.nextCursor;
 
-    // persist progress
     await prisma.reportRunState.update({
       where: { id: runId },
-      data: {
-        cursor: cursor,
-        processedOrders,
-        salesByVariant,
-        status: "running",
-        error: null,
-      },
+      data: { cursor, processedOrders, salesByVariant, status: "running", error: null },
     });
 
     if (!chunk.hasNextPage) {
@@ -508,7 +476,6 @@ async function continueReportRun(admin, shopDomain, runId) {
       return { ...doneRun, progressMessage: "Report scan complete." };
     }
 
-    // Small delay to be kind to API
     await sleep(200);
   }
 
@@ -540,10 +507,9 @@ export async function action({ request }) {
     const lookBackDays = toInt(formData.get("lookBackDays"), 60);
 
     if (!shopDomain) {
-      return { error: "Missing shop domain (needed for Stocky + caching).", inputs: { periodQtySoldLTE, lookBackDays } };
+      return { error: "Missing shop domain.", inputs: { periodQtySoldLTE, lookBackDays } };
     }
 
-    // STOCKY FULL SYNC
     if (intent === "stockyFullSync") {
       if (!stockyApiKey) return { error: "STOCKY_API_KEY is not set.", inputs: { periodQtySoldLTE, lookBackDays } };
 
@@ -551,13 +517,9 @@ export async function action({ request }) {
       const startFresh = mode === "start";
 
       const chunk = await runFullSyncChunk({ shopDomain, stockyApiKey, startFresh });
-      return {
-        inputs: { periodQtySoldLTE, lookBackDays },
-        fullSync: chunk,
-      };
+      return { inputs: { periodQtySoldLTE, lookBackDays }, fullSync: chunk };
     }
 
-    // STOCKY QUICK SYNC
     if (intent === "stockyQuickSync") {
       if (!stockyApiKey) return { error: "STOCKY_API_KEY is not set.", inputs: { periodQtySoldLTE, lookBackDays } };
 
@@ -568,15 +530,12 @@ export async function action({ request }) {
       };
     }
 
-    // REPORT START
     if (intent === "reportStart") {
       if (periodQtySoldLTE < 0 || lookBackDays <= 0) {
-        return { error: "Invalid input values. Qty must be >= 0 and days must be > 0.", inputs: { periodQtySoldLTE, lookBackDays } };
+        return { error: "Invalid input values.", inputs: { periodQtySoldLTE, lookBackDays } };
       }
 
       const run = await startReportRun(shopDomain, periodQtySoldLTE, lookBackDays);
-
-      // do a first chunk immediately so user sees progress fast
       const progressed = await continueReportRun(admin, shopDomain, run.id);
 
       return {
@@ -590,14 +549,12 @@ export async function action({ request }) {
       };
     }
 
-    // REPORT CONTINUE
     if (intent === "reportContinue") {
       const runId = String(formData.get("runId") || "");
       if (!runId) return { error: "Missing runId.", inputs: { periodQtySoldLTE, lookBackDays } };
 
       const progressed = await continueReportRun(admin, shopDomain, runId);
 
-      // If not done, just return progress
       if (!progressed.done) {
         return {
           inputs: { periodQtySoldLTE, lookBackDays },
@@ -610,10 +567,8 @@ export async function action({ request }) {
         };
       }
 
-      // DONE: build output using cached Stocky receipt dates + salesByVariant map
       const allVariantsResult = await fetchAllActiveVariants(admin);
 
-      // receipts for SKU -> first/last received
       const wantedSkus = [];
       for (const v of allVariantsResult.variants) {
         const skuFromVariant = String(v?.sku ?? "").trim();
@@ -637,9 +592,10 @@ export async function action({ request }) {
         };
       }
 
-      const salesByVariant = progressed.salesByVariant && typeof progressed.salesByVariant === "object"
-        ? progressed.salesByVariant
-        : {};
+      const salesByVariant =
+        progressed.salesByVariant && typeof progressed.salesByVariant === "object"
+          ? progressed.salesByVariant
+          : {};
 
       const rows = allVariantsResult.variants
         .map((v) => {
@@ -700,10 +656,8 @@ export async function action({ request }) {
 
     return { error: `Unknown intent: ${intent}`, inputs: { periodQtySoldLTE, lookBackDays } };
   } catch (e) {
-    // ✅ This makes Render show the *real* cause in logs
     console.error("Markdown Report action failed:", e);
 
-    // If Shopify throws a Response (redirect/unauthorized), return it.
     if (e instanceof Response) return e;
     if (e && typeof e === "object" && e.constructor?.name === "Response") return e;
 
@@ -720,10 +674,13 @@ export default function MarkdownReport() {
   const navigation = useNavigation();
   const busy = navigation.state === "submitting";
 
+  const location = useLocation();
+  const actionUrl = location.pathname + location.search; // ✅ preserve embedded params
+
   const fullSyncFetcher = useFetcher();
   const quickSyncFetcher = useFetcher();
-
   const reportFetcher = useFetcher();
+
   const [isFullSyncRunning, setIsFullSyncRunning] = useState(false);
   const [isReportRunning, setIsReportRunning] = useState(false);
 
@@ -736,7 +693,7 @@ export default function MarkdownReport() {
     );
   }, [reportFetcher.data, fullSyncFetcher.data, quickSyncFetcher.data, actionData?.inputs]);
 
-  // Full sync loop
+  // Full sync loop (continue)
   useEffect(() => {
     if (fullSyncFetcher.data?.error) setIsFullSyncRunning(false);
   }, [fullSyncFetcher.data]);
@@ -760,14 +717,14 @@ export default function MarkdownReport() {
           periodQtySoldLTE: String(currentInputs.periodQtySoldLTE ?? 0),
           lookBackDays: String(currentInputs.lookBackDays ?? 60),
         },
-        { method: "post" }
+        { method: "post", action: actionUrl } // ✅ keep embedded params
       );
     }, delay);
 
     return () => clearTimeout(t);
-  }, [fullSyncFetcher.data, currentInputs, fullSyncFetcher]);
+  }, [fullSyncFetcher.data, currentInputs, fullSyncFetcher, actionUrl]);
 
-  // Report loop
+  // Report loop (continue)
   useEffect(() => {
     const r = reportFetcher.data?.report;
     if (!r) return;
@@ -788,12 +745,12 @@ export default function MarkdownReport() {
           periodQtySoldLTE: String(currentInputs.periodQtySoldLTE ?? 0),
           lookBackDays: String(currentInputs.lookBackDays ?? 60),
         },
-        { method: "post" }
+        { method: "post", action: actionUrl } // ✅ keep embedded params
       );
     }, 900);
 
     return () => clearTimeout(t);
-  }, [reportFetcher.data, reportFetcher, currentInputs]);
+  }, [reportFetcher.data, reportFetcher, currentInputs, actionUrl]);
 
   const styles = {
     page: { padding: 16 },
@@ -851,7 +808,7 @@ export default function MarkdownReport() {
     <div style={styles.page}>
       {/* Sync buttons at top */}
       <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-        <fullSyncFetcher.Form method="post" style={{ margin: 0 }}>
+        <fullSyncFetcher.Form method="post" action={actionUrl} style={{ margin: 0 }}>
           <input type="hidden" name="intent" value="stockyFullSync" />
           <input type="hidden" name="mode" value="start" />
           <input type="hidden" name="periodQtySoldLTE" value={currentInputs.periodQtySoldLTE ?? 0} />
@@ -866,7 +823,7 @@ export default function MarkdownReport() {
           </button>
         </fullSyncFetcher.Form>
 
-        <quickSyncFetcher.Form method="post" style={{ margin: 0 }}>
+        <quickSyncFetcher.Form method="post" action={actionUrl} style={{ margin: 0 }}>
           <input type="hidden" name="intent" value="stockyQuickSync" />
           <input type="hidden" name="periodQtySoldLTE" value={currentInputs.periodQtySoldLTE ?? 0} />
           <input type="hidden" name="lookBackDays" value={currentInputs.lookBackDays ?? 60} />
@@ -888,9 +845,9 @@ export default function MarkdownReport() {
 
       <h1 style={styles.h1}>Markdown Report</h1>
 
-      {/* Report form now uses reportFetcher so it can auto-continue */}
       <reportFetcher.Form
         method="post"
+        action={actionUrl} // ✅ preserve embedded params
         onSubmit={() => setIsReportRunning(true)}
       >
         <input type="hidden" name="intent" value="reportStart" />
