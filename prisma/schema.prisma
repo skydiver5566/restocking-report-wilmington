@@ -43,7 +43,6 @@ model StockySkuReceipt {
 
   @@unique([shop, sku])
   @@index([shop])
-  @@index([shop, sku])
 }
 
 model StockySyncState {
@@ -52,4 +51,30 @@ model StockySyncState {
   fullDone    Boolean  @default(false)
   updatedAt   DateTime @updatedAt
   createdAt   DateTime @default(now())
+}
+
+model ReportRunState {
+  id               String   @id @default(cuid())
+  shop             String
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  // Inputs used for the run
+  periodQtySoldLTE Int
+  lookBackDays     Int
+  sinceISO         String
+
+  // Progress
+  cursor           String?
+  done             Boolean  @default(false)
+  processedOrders  Int      @default(0)
+
+  // Aggregation map: { [variantGid]: { qtySold, firstSoldDate, lastSoldDate } }
+  salesByVariant   Json     @default("{}")
+
+  // Error visibility
+  status           String   @default("running") // running | done | error
+  error            String?
+
+  @@index([shop, createdAt])
 }
