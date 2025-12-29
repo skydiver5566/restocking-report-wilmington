@@ -9,9 +9,10 @@ generator client {
 // enough when changing adapters.
 // See https://www.prisma.io/docs/orm/reference/prisma-schema-reference#string for more information
 datasource db {
-  provider = "sqlite"
-  url      = "file:dev.sqlite"
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
 }
+
 
 model Session {
   id            String    @id
@@ -29,4 +30,26 @@ model Session {
   locale        String?
   collaborator  Boolean?  @default(false)
   emailVerified Boolean?  @default(false)
+}
+
+model StockySkuReceipt {
+  id              String   @id @default(cuid())
+  shop            String
+  sku             String
+  firstReceivedAt DateTime?
+  lastReceivedAt  DateTime?
+  updatedAt       DateTime @updatedAt
+  createdAt       DateTime @default(now())
+
+  @@unique([shop, sku])
+  @@index([shop])
+  @@index([shop, sku])
+}
+
+model StockySyncState {
+  shop        String   @id
+  fullOffset  Int      @default(0)
+  fullDone    Boolean  @default(false)
+  updatedAt   DateTime @updatedAt
+  createdAt   DateTime @default(now())
 }
