@@ -1,6 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { useActionData, useFetcher, useLocation, useNavigation } from "react-router";
-import { json } from "@remix-run/node";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 
@@ -62,9 +61,8 @@ async function fetchWithTimeout(url, init = {}, timeoutMs = 15000) {
 }
 
 async function adminGraphql(admin, query, variables) {
-  // Guard against a client call hanging forever
+  // Prevent an infinite hang if upstream stalls
   const LABEL = "Shopify Admin GraphQL";
-
   if (typeof admin?.graphql === "function") {
     const resp = await withTimeout(admin.graphql(query, { variables }), 20000, LABEL);
     if (resp?.json) return await resp.json();
@@ -542,19 +540,11 @@ export async function action({ request }) {
     const lookBackDays = toInt(formData.get("lookBackDays"), 60);
 
     if (!shopDomain) {
-      return json(
-        { error: "Missing shop domain.", inputs: { periodQtySoldLTE, lookBackDays } },
-        { status: 400 }
-      );
+      return { error: "Missing shop domain.", inputs: { periodQtySoldLTE, lookBackDays } };
     }
 
     if (intent === "stockyFullSync") {
-      if (!stockyApiKey) {
-        return json(
-          { error: "STOCKY_API_KEY is not set.", inputs: { periodQtySoldLTE, lookBackDays } },
-          { status: 500 }
-        );
-      }
+      if (!stockyApiKey) return { error: "STOCKY_API_KEY is not set.", inputs: { periodQtySoldLTE, lookBackDays } };
 
       const mode = String(formData.get("mode") || "continue");
       const startFresh = mode === "start";
@@ -563,33 +553,25 @@ export async function action({ request }) {
       const chunk = await runFullSyncChunk({ shopDomain, stockyApiKey, startFresh });
       log("after runFullSyncChunk()", msSince(t0));
 
-      return json({ inputs: { periodQtySoldLTE, lookBackDays }, fullSync: chunk });
+      return { inputs: { periodQtySoldLTE, lookBackDays }, fullSync: chunk };
     }
 
     if (intent === "stockyQuickSync") {
-      if (!stockyApiKey) {
-        return json(
-          { error: "STOCKY_API_KEY is not set.", inputs: { periodQtySoldLTE, lookBackDays } },
-          { status: 500 }
-        );
-      }
+      if (!stockyApiKey) return { error: "STOCKY_API_KEY is not set.", inputs: { periodQtySoldLTE, lookBackDays } };
 
       log("before stockyQuickSync()", msSince(t0));
       const r = await stockyQuickSync({ shopDomain, stockyApiKey });
       log("after stockyQuickSync()", msSince(t0));
 
-      return json({
+      return {
         inputs: { periodQtySoldLTE, lookBackDays },
         message: `Quick Sync complete. Scanned ${r.scannedOrders} POs, updated ${r.itemsProcessed} received items.`,
-      });
+      };
     }
 
     if (intent === "reportStart") {
       if (periodQtySoldLTE < 0 || lookBackDays <= 0) {
-        return json(
-          { error: "Invalid input values.", inputs: { periodQtySoldLTE, lookBackDays } },
-          { status: 400 }
-        );
+        return { error: "Invalid input values.", inputs: { periodQtySoldLTE, lookBackDays } };
       }
 
       log("before startReportRun()", msSince(t0));
@@ -603,7 +585,7 @@ export async function action({ request }) {
         processed: progressed.processedOrders ?? 0,
       });
 
-      return json({
+      return {
         inputs: { periodQtySoldLTE, lookBackDays },
         report: {
           runId: run.id,
@@ -611,17 +593,12 @@ export async function action({ request }) {
           processedOrders: progressed.processedOrders ?? 0,
           message: progressed.progressMessage ?? "Scanning orders…",
         },
-      });
+      };
     }
 
     if (intent === "reportContinue") {
       const runId = String(formData.get("runId") || "");
-      if (!runId) {
-        return json(
-          { error: "Missing runId.", inputs: { periodQtySoldLTE, lookBackDays } },
-          { status: 400 }
-        );
-      }
+      if (!runId) return { error: "Missing runId.", inputs: { periodQtySoldLTE, lookBackDays } };
 
       log("before continueReportRun(continue)", msSince(t0), { runId });
       const progressed = await continueReportRun(admin, shopDomain, runId);
@@ -631,7 +608,7 @@ export async function action({ request }) {
       });
 
       if (!progressed.done) {
-        return json({
+        return {
           inputs: { periodQtySoldLTE, lookBackDays },
           report: {
             runId,
@@ -639,7 +616,7 @@ export async function action({ request }) {
             processedOrders: progressed.processedOrders ?? 0,
             message: progressed.progressMessage ?? `Scanning orders… processed ${progressed.processedOrders ?? 0}.`,
           },
-        });
+        };
       }
 
       log("before fetchAllActiveVariants()", msSince(t0));
@@ -722,7 +699,7 @@ export async function action({ request }) {
       log("after build rows", msSince(t0), { rows: rows.length });
       log("returning response", msSince(t0));
 
-      return json({
+      return {
         inputs: { periodQtySoldLTE, lookBackDays },
         report: {
           runId,
@@ -734,17 +711,15 @@ export async function action({ request }) {
         rowsCount: rows.length,
         truncated: allVariantsResult.truncated,
         maxVariants: allVariantsResult.max,
-      });
+      };
     }
 
-    return json({ error: `Unknown intent: ${intent}`, inputs: { periodQtySoldLTE, lookBackDays } }, { status: 400 });
+    return { error: `Unknown intent: ${intent}`, inputs: { periodQtySoldLTE, lookBackDays } };
   } catch (e) {
     logErr("action failed", msSince(t0), e);
-
     if (e instanceof Response) return e;
     if (e && typeof e === "object" && e.constructor?.name === "Response") return e;
-
-    return json({ error: e?.message ?? String(e) }, { status: 500 });
+    return { error: e?.message ?? String(e) };
   }
 }
 
@@ -790,7 +765,7 @@ export default function MarkdownReport() {
       return;
     }
 
-    // ✅ avoid scheduling while a request is in-flight (prevents double-post loops)
+    // ✅ prevent double-submits while in-flight
     if (fullSyncFetcher.state !== "idle") return;
 
     const delay = Number(d.suggestedNextPollMs ?? 1500);
@@ -803,7 +778,7 @@ export default function MarkdownReport() {
           periodQtySoldLTE: String(currentInputs.periodQtySoldLTE ?? 0),
           lookBackDays: String(currentInputs.lookBackDays ?? 60),
         },
-        { method: "post", action: actionUrl } // ✅ keep embedded params
+        { method: "post", action: actionUrl }
       );
     }, delay);
 
@@ -820,7 +795,7 @@ export default function MarkdownReport() {
       return;
     }
 
-    // ✅ avoid scheduling while a request is in-flight (prevents double-post loops)
+    // ✅ prevent double-submits while in-flight
     if (reportFetcher.state !== "idle") return;
 
     const runId = r.runId;
@@ -834,7 +809,7 @@ export default function MarkdownReport() {
           periodQtySoldLTE: String(currentInputs.periodQtySoldLTE ?? 0),
           lookBackDays: String(currentInputs.lookBackDays ?? 60),
         },
-        { method: "post", action: actionUrl } // ✅ keep embedded params
+        { method: "post", action: actionUrl }
       );
     }, 900);
 
@@ -916,11 +891,7 @@ export default function MarkdownReport() {
           <input type="hidden" name="intent" value="stockyQuickSync" />
           <input type="hidden" name="periodQtySoldLTE" value={currentInputs.periodQtySoldLTE ?? 0} />
           <input type="hidden" name="lookBackDays" value={currentInputs.lookBackDays ?? 60} />
-          <button
-            type="submit"
-            style={styles.smallButton}
-            disabled={busy || fullSyncBusy || quickSyncBusy || isReportRunning}
-          >
+          <button type="submit" style={styles.smallButton} disabled={busy || fullSyncBusy || quickSyncBusy || isReportRunning}>
             {quickSyncBusy ? "Quick Sync Running…" : "Quick Sync Stocky Cache"}
           </button>
         </quickSyncFetcher.Form>
@@ -943,24 +914,12 @@ export default function MarkdownReport() {
 
         <div style={styles.row}>
           <div style={styles.label}>Period Qty Sold (Less Than or Equal To):</div>
-          <input
-            style={styles.input}
-            type="number"
-            name="periodQtySoldLTE"
-            defaultValue={currentInputs.periodQtySoldLTE ?? 0}
-            min="0"
-          />
+          <input style={styles.input} type="number" name="periodQtySoldLTE" defaultValue={currentInputs.periodQtySoldLTE ?? 0} min="0" />
         </div>
 
         <div style={styles.row}>
           <div style={styles.label}>Look Back Period (Days):</div>
-          <input
-            style={styles.input}
-            type="number"
-            name="lookBackDays"
-            defaultValue={currentInputs.lookBackDays ?? 60}
-            min="1"
-          />
+          <input style={styles.input} type="number" name="lookBackDays" defaultValue={currentInputs.lookBackDays ?? 60} min="1" />
         </div>
 
         <button style={styles.submit} type="submit" disabled={busy || fullSyncBusy || reportFetcher.state !== "idle"}>
