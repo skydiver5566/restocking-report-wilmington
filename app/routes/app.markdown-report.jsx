@@ -205,9 +205,7 @@ export default function MarkdownReport() {
   const navigation = useNavigation();
   const location = useLocation();
 
-  const [runId, setRunId] = useState(() => {
-    return sessionStorage.getItem("markdownReportRunId");
-  });
+  const [runId, setRunId] = useState(null);
 
   const actionUrl = useMemo(() => {
     const sp = new URLSearchParams(location.search);
@@ -220,8 +218,17 @@ export default function MarkdownReport() {
     return `${location.pathname}?${keep.toString()}`;
   }, [location.pathname, location.search]);
 
-  // Save runId when we get one
+  // Load runId from sessionStorage (client-only)
   useEffect(() => {
+    if (typeof window === "undefined") return;
+    const stored = sessionStorage.getItem("markdownReportRunId");
+    if (stored) setRunId(stored);
+  }, []);
+
+  // Save / clear runId
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+
     const r = reportFetcher.data?.report || actionData?.report;
     if (r?.runId) {
       sessionStorage.setItem("markdownReportRunId", r.runId);
@@ -229,6 +236,7 @@ export default function MarkdownReport() {
     }
     if (r?.done) {
       sessionStorage.removeItem("markdownReportRunId");
+      setRunId(null);
     }
   }, [reportFetcher.data, actionData]);
 
