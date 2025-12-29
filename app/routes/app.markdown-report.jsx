@@ -218,17 +218,16 @@ export default function MarkdownReport() {
     return `${location.pathname}?${keep.toString()}`;
   }, [location.pathname, location.search]);
 
-  // Load runId from sessionStorage (client-only)
+  // Restore runId after reload
   useEffect(() => {
     if (typeof window === "undefined") return;
     const stored = sessionStorage.getItem("markdownReportRunId");
     if (stored) setRunId(stored);
   }, []);
 
-  // Save / clear runId
+  // Save runId
   useEffect(() => {
     if (typeof window === "undefined") return;
-
     const r = reportFetcher.data?.report || actionData?.report;
     if (r?.runId) {
       sessionStorage.setItem("markdownReportRunId", r.runId);
@@ -260,12 +259,18 @@ export default function MarkdownReport() {
     <div style={{ padding: 16 }}>
       <h1>Markdown Report</h1>
 
-      <reportFetcher.Form method="post" action={actionUrl}>
-        <input type="hidden" name="intent" value="reportStart" />
-        <button disabled={navigation.state === "submitting"}>
-          Generate Report
-        </button>
-      </reportFetcher.Form>
+      {/* IMPORTANT: button + submit, NOT fetcher.Form */}
+      <button
+        disabled={navigation.state === "submitting"}
+        onClick={() => {
+          reportFetcher.submit(
+            { intent: "reportStart" },
+            { method: "post", action: actionUrl }
+          );
+        }}
+      >
+        Generate Report
+      </button>
 
       {report ? (
         <pre style={{ marginTop: 12 }}>
