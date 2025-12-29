@@ -218,28 +218,29 @@ export default function MarkdownReport() {
     return `${location.pathname}?${keep.toString()}`;
   }, [location.pathname, location.search]);
 
-  // Restore runId after reload
+  /* ---------- SSR-safe sessionStorage ---------- */
+
   useEffect(() => {
     if (typeof window === "undefined") return;
-    const stored = sessionStorage.getItem("markdownReportRunId");
+    const stored = window.sessionStorage.getItem("markdownReportRunId");
     if (stored) setRunId(stored);
   }, []);
 
-  // Save runId
   useEffect(() => {
     if (typeof window === "undefined") return;
     const r = reportFetcher.data?.report || actionData?.report;
     if (r?.runId) {
-      sessionStorage.setItem("markdownReportRunId", r.runId);
+      window.sessionStorage.setItem("markdownReportRunId", r.runId);
       setRunId(r.runId);
     }
     if (r?.done) {
-      sessionStorage.removeItem("markdownReportRunId");
+      window.sessionStorage.removeItem("markdownReportRunId");
       setRunId(null);
     }
   }, [reportFetcher.data, actionData]);
 
-  // Poll loop
+  /* ---------- Poll loop ---------- */
+
   useEffect(() => {
     if (!runId) return;
 
@@ -259,10 +260,12 @@ export default function MarkdownReport() {
     <div style={{ padding: 16 }}>
       <h1>Markdown Report</h1>
 
-      {/* IMPORTANT: button + submit, NOT fetcher.Form */}
+      {/* ✅ IMPORTANT: button, NOT form */}
       <button
+        type="button"
         disabled={navigation.state === "submitting"}
-        onClick={() => {
+        onClick={(e) => {
+          e.preventDefault();
           reportFetcher.submit(
             { intent: "reportStart" },
             { method: "post", action: actionUrl }
@@ -275,7 +278,7 @@ export default function MarkdownReport() {
       {report ? (
         <pre style={{ marginTop: 12 }}>
           {report.message}
-          {"\n"}Processed: {report.processedOrders}
+          {"\n"}Processed orders: {report.processedOrders}
           {"\n"}Done: {String(report.done)}
         </pre>
       ) : null}
