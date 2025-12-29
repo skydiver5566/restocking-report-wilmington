@@ -149,11 +149,7 @@ async function continueReportRun(admin, shop, runId) {
 export async function action({ request }) {
   try {
     const auth = await authenticate.admin(request);
-
-    // 🔑 IMPORTANT: auth redirect must be returned immediately
-    if (auth instanceof Response) {
-      return auth;
-    }
+    if (auth instanceof Response) return auth;
 
     const { admin, session } = auth;
     const shop = session.shop;
@@ -194,7 +190,6 @@ export async function action({ request }) {
 
     return { error: "Unknown intent" };
   } catch (err) {
-    // 🔑 If Shopify throws a redirect Response, return it
     if (err instanceof Response) return err;
     throw err;
   }
@@ -210,6 +205,10 @@ export default function MarkdownReport() {
   const navigation = useNavigation();
   const location = useLocation();
 
+  const [runId, setRunId] = useState(() => {
+    return sessionStorage.getItem("markdownReportRunId");
+  });
+
   const actionUrl = useMemo(() => {
     const sp = new URLSearchParams(location.search);
     const keep = new URLSearchParams();
@@ -221,19 +220,31 @@ export default function MarkdownReport() {
     return `${location.pathname}?${keep.toString()}`;
   }, [location.pathname, location.search]);
 
+  // Save runId when we get one
   useEffect(() => {
-    const r = reportFetcher.data?.report;
-    if (!r || r.done) return;
+    const r = reportFetcher.data?.report || actionData?.report;
+    if (r?.runId) {
+      sessionStorage.setItem("markdownReportRunId", r.runId);
+      setRunId(r.runId);
+    }
+    if (r?.done) {
+      sessionStorage.removeItem("markdownReportRunId");
+    }
+  }, [reportFetcher.data, actionData]);
+
+  // Poll loop
+  useEffect(() => {
+    if (!runId) return;
 
     const t = setTimeout(() => {
       reportFetcher.submit(
-        { intent: "reportContinue", runId: r.runId },
+        { intent: "reportContinue", runId },
         { method: "post", action: actionUrl }
       );
     }, 350);
 
     return () => clearTimeout(t);
-  }, [reportFetcher.data, reportFetcher, actionUrl]);
+  }, [runId, reportFetcher, actionUrl]);
 
   const report = reportFetcher.data?.report || actionData?.report;
 
