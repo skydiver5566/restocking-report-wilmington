@@ -1,11 +1,6 @@
 import React, { useEffect, useMemo, useState } from "react";
-import {
-  Form,
-  useActionData,
-  useNavigation,
-  useFetcher,
-  useLocation,
-} from "react-router";
+import { useActionData, useFetcher, useLocation, useNavigation } from "react-router";
+import { json } from "@remix-run/node";
 import { authenticate } from "../shopify.server";
 import prisma from "../db.server";
 
@@ -39,14 +34,44 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function msSince(t0) {
+  return `${Date.now() - t0}ms`;
+}
+
+async function withTimeout(promise, timeoutMs, label = "operation") {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function fetchWithTimeout(url, init = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(id);
+  }
+}
+
 async function adminGraphql(admin, query, variables) {
+  // Guard against a client call hanging forever
+  const LABEL = "Shopify Admin GraphQL";
+
   if (typeof admin?.graphql === "function") {
-    const resp = await admin.graphql(query, { variables });
+    const resp = await withTimeout(admin.graphql(query, { variables }), 20000, LABEL);
     if (resp?.json) return await resp.json();
     return resp;
   }
   if (typeof admin?.request === "function") {
-    return await admin.request(query, { variables });
+    return await withTimeout(admin.request(query, { variables }), 20000, LABEL);
   }
   throw new Error("No supported GraphQL method found on admin client.");
 }
@@ -56,8 +81,7 @@ async function adminGraphql(admin, query, variables) {
 ========================= */
 
 function mergeSalesMap(existingJson, ordersEdges) {
-  const sales =
-    existingJson && typeof existingJson === "object" ? existingJson : {};
+  const sales = existingJson && typeof existingJson === "object" ? existingJson : {};
 
   for (const edge of ordersEdges ?? []) {
     const createdAt = edge?.node?.createdAt;
@@ -76,20 +100,13 @@ function mergeSalesMap(existingJson, ordersEdges) {
         };
       }
 
-      sales[variantId].qtySold =
-        Number(sales[variantId].qtySold ?? 0) + Number(qty ?? 0);
+      sales[variantId].qtySold = Number(sales[variantId].qtySold ?? 0) + Number(qty ?? 0);
 
       if (createdAt) {
-        if (
-          !sales[variantId].firstSoldDate ||
-          createdAt < sales[variantId].firstSoldDate
-        ) {
+        if (!sales[variantId].firstSoldDate || createdAt < sales[variantId].firstSoldDate) {
           sales[variantId].firstSoldDate = createdAt;
         }
-        if (
-          !sales[variantId].lastSoldDate ||
-          createdAt > sales[variantId].lastSoldDate
-        ) {
+        if (!sales[variantId].lastSoldDate || createdAt > sales[variantId].lastSoldDate) {
           sales[variantId].lastSoldDate = createdAt;
         }
       }
@@ -214,29 +231,28 @@ async function fetchStockyPurchaseOrdersPage({ shopDomain, stockyApiKey, limit, 
   const MAX_RETRIES = 6;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const resp = await fetch(url.toString(), {
-      method: "GET",
-      headers: {
-        "Store-Name": shopDomain,
-        Authorization: `API KEY=${stockyApiKey}`,
-        Accept: "application/json",
+    const resp = await fetchWithTimeout(
+      url.toString(),
+      {
+        method: "GET",
+        headers: {
+          "Store-Name": shopDomain,
+          Authorization: `API KEY=${stockyApiKey}`,
+          Accept: "application/json",
+        },
       },
-    });
+      15000
+    );
 
     if (resp.status === 429) {
       const retryAfterHeader = resp.headers.get("retry-after");
       const retryAfterSeconds = retryAfterHeader ? Number(retryAfterHeader) : NaN;
 
-      const baseWaitMs = Number.isFinite(retryAfterSeconds)
-        ? Math.max(1000, retryAfterSeconds * 1000)
-        : 2000;
-
+      const baseWaitMs = Number.isFinite(retryAfterSeconds) ? Math.max(1000, retryAfterSeconds * 1000) : 2000;
       const waitMs = Math.min(30000, baseWaitMs * Math.pow(2, attempt));
 
       if (attempt === MAX_RETRIES) {
-        throw new Error(
-          `Stocky API error (429): rate limited. Retried ${MAX_RETRIES + 1} times.`
-        );
+        throw new Error(`Stocky API error (429): rate limited. Retried ${MAX_RETRIES + 1} times.`);
       }
 
       await sleep(waitMs);
@@ -248,8 +264,8 @@ async function fetchStockyPurchaseOrdersPage({ shopDomain, stockyApiKey, limit, 
       throw new Error(`Stocky API error (${resp.status}). ${text}`.trim());
     }
 
-    const json = await resp.json();
-    const purchaseOrders = json?.purchase_orders ?? [];
+    const jsonResp = await resp.json();
+    const purchaseOrders = jsonResp?.purchase_orders ?? [];
     return Array.isArray(purchaseOrders) ? purchaseOrders : [];
   }
 
@@ -353,7 +369,14 @@ async function runFullSyncChunk({ shopDomain, stockyApiKey, startFresh }) {
 
   const state = await getOrCreateSyncState(shopDomain);
   if (state.fullDone) {
-    return { done: true, offset: state.fullOffset, scannedOrders: 0, itemsProcessed: 0, message: "Full Sync already complete.", suggestedNextPollMs: 0 };
+    return {
+      done: true,
+      offset: state.fullOffset,
+      scannedOrders: 0,
+      itemsProcessed: 0,
+      message: "Full Sync already complete.",
+      suggestedNextPollMs: 0,
+    };
   }
 
   const startedAt = Date.now();
@@ -491,8 +514,17 @@ async function continueReportRun(admin, shopDomain, runId) {
 ========================= */
 
 export async function action({ request }) {
+  const t0 = Date.now();
+  const rid = Math.random().toString(16).slice(2, 10);
+
+  const log = (...args) => console.log(`[markdown-report][${rid}]`, ...args);
+  const logErr = (...args) => console.error(`[markdown-report][${rid}]`, ...args);
+
   try {
+    log("action start", msSince(t0));
+
     const { admin, session } = await authenticate.admin(request);
+    log("after auth", msSince(t0), session?.shop);
 
     const reqUrl = new URL(request.url);
     const shopFromUrl = reqUrl.searchParams.get("shop");
@@ -500,45 +532,78 @@ export async function action({ request }) {
 
     const stockyApiKey = process.env.STOCKY_API_KEY || "";
 
+    log("before formData()", msSince(t0));
     const formData = await request.formData();
+    log("after formData()", msSince(t0));
+
     const intent = String(formData.get("intent") || "reportStart");
 
     const periodQtySoldLTE = toInt(formData.get("periodQtySoldLTE"), 0);
     const lookBackDays = toInt(formData.get("lookBackDays"), 60);
 
     if (!shopDomain) {
-      return { error: "Missing shop domain.", inputs: { periodQtySoldLTE, lookBackDays } };
+      return json(
+        { error: "Missing shop domain.", inputs: { periodQtySoldLTE, lookBackDays } },
+        { status: 400 }
+      );
     }
 
     if (intent === "stockyFullSync") {
-      if (!stockyApiKey) return { error: "STOCKY_API_KEY is not set.", inputs: { periodQtySoldLTE, lookBackDays } };
+      if (!stockyApiKey) {
+        return json(
+          { error: "STOCKY_API_KEY is not set.", inputs: { periodQtySoldLTE, lookBackDays } },
+          { status: 500 }
+        );
+      }
 
       const mode = String(formData.get("mode") || "continue");
       const startFresh = mode === "start";
 
+      log("before runFullSyncChunk()", msSince(t0), { startFresh });
       const chunk = await runFullSyncChunk({ shopDomain, stockyApiKey, startFresh });
-      return { inputs: { periodQtySoldLTE, lookBackDays }, fullSync: chunk };
+      log("after runFullSyncChunk()", msSince(t0));
+
+      return json({ inputs: { periodQtySoldLTE, lookBackDays }, fullSync: chunk });
     }
 
     if (intent === "stockyQuickSync") {
-      if (!stockyApiKey) return { error: "STOCKY_API_KEY is not set.", inputs: { periodQtySoldLTE, lookBackDays } };
+      if (!stockyApiKey) {
+        return json(
+          { error: "STOCKY_API_KEY is not set.", inputs: { periodQtySoldLTE, lookBackDays } },
+          { status: 500 }
+        );
+      }
 
+      log("before stockyQuickSync()", msSince(t0));
       const r = await stockyQuickSync({ shopDomain, stockyApiKey });
-      return {
+      log("after stockyQuickSync()", msSince(t0));
+
+      return json({
         inputs: { periodQtySoldLTE, lookBackDays },
         message: `Quick Sync complete. Scanned ${r.scannedOrders} POs, updated ${r.itemsProcessed} received items.`,
-      };
+      });
     }
 
     if (intent === "reportStart") {
       if (periodQtySoldLTE < 0 || lookBackDays <= 0) {
-        return { error: "Invalid input values.", inputs: { periodQtySoldLTE, lookBackDays } };
+        return json(
+          { error: "Invalid input values.", inputs: { periodQtySoldLTE, lookBackDays } },
+          { status: 400 }
+        );
       }
 
+      log("before startReportRun()", msSince(t0));
       const run = await startReportRun(shopDomain, periodQtySoldLTE, lookBackDays);
-      const progressed = await continueReportRun(admin, shopDomain, run.id);
+      log("after startReportRun()", msSince(t0), { runId: run.id });
 
-      return {
+      log("before continueReportRun(start)", msSince(t0));
+      const progressed = await continueReportRun(admin, shopDomain, run.id);
+      log("after continueReportRun(start)", msSince(t0), {
+        done: progressed.done,
+        processed: progressed.processedOrders ?? 0,
+      });
+
+      return json({
         inputs: { periodQtySoldLTE, lookBackDays },
         report: {
           runId: run.id,
@@ -546,17 +611,27 @@ export async function action({ request }) {
           processedOrders: progressed.processedOrders ?? 0,
           message: progressed.progressMessage ?? "Scanning orders…",
         },
-      };
+      });
     }
 
     if (intent === "reportContinue") {
       const runId = String(formData.get("runId") || "");
-      if (!runId) return { error: "Missing runId.", inputs: { periodQtySoldLTE, lookBackDays } };
+      if (!runId) {
+        return json(
+          { error: "Missing runId.", inputs: { periodQtySoldLTE, lookBackDays } },
+          { status: 400 }
+        );
+      }
 
+      log("before continueReportRun(continue)", msSince(t0), { runId });
       const progressed = await continueReportRun(admin, shopDomain, runId);
+      log("after continueReportRun(continue)", msSince(t0), {
+        done: progressed.done,
+        processed: progressed.processedOrders ?? 0,
+      });
 
       if (!progressed.done) {
-        return {
+        return json({
           inputs: { periodQtySoldLTE, lookBackDays },
           report: {
             runId,
@@ -564,10 +639,15 @@ export async function action({ request }) {
             processedOrders: progressed.processedOrders ?? 0,
             message: progressed.progressMessage ?? `Scanning orders… processed ${progressed.processedOrders ?? 0}.`,
           },
-        };
+        });
       }
 
+      log("before fetchAllActiveVariants()", msSince(t0));
       const allVariantsResult = await fetchAllActiveVariants(admin);
+      log("after fetchAllActiveVariants()", msSince(t0), {
+        variants: allVariantsResult.variants?.length ?? 0,
+        truncated: allVariantsResult.truncated,
+      });
 
       const wantedSkus = [];
       for (const v of allVariantsResult.variants) {
@@ -577,12 +657,14 @@ export async function action({ request }) {
         if (sku) wantedSkus.push(sku);
       }
 
+      log("before receipts findMany()", msSince(t0), { wantedSkus: wantedSkus.length });
       const receipts = wantedSkus.length
         ? await prisma.stockySkuReceipt.findMany({
             where: { shop: shopDomain, sku: { in: wantedSkus } },
             select: { sku: true, firstReceivedAt: true, lastReceivedAt: true },
           })
         : [];
+      log("after receipts findMany()", msSince(t0), { receipts: receipts.length });
 
       const receiptMap = {};
       for (const r of receipts) {
@@ -592,11 +674,9 @@ export async function action({ request }) {
         };
       }
 
-      const salesByVariant =
-        progressed.salesByVariant && typeof progressed.salesByVariant === "object"
-          ? progressed.salesByVariant
-          : {};
+      const salesByVariant = progressed.salesByVariant && typeof progressed.salesByVariant === "object" ? progressed.salesByVariant : {};
 
+      log("before build rows", msSince(t0));
       const rows = allVariantsResult.variants
         .map((v) => {
           const sales = salesByVariant[v.id] ?? { qtySold: 0, firstSoldDate: null, lastSoldDate: null };
@@ -639,7 +719,10 @@ export async function action({ request }) {
         })
         .map(({ qtySold, ...rest }) => rest);
 
-      return {
+      log("after build rows", msSince(t0), { rows: rows.length });
+      log("returning response", msSince(t0));
+
+      return json({
         inputs: { periodQtySoldLTE, lookBackDays },
         report: {
           runId,
@@ -651,17 +734,17 @@ export async function action({ request }) {
         rowsCount: rows.length,
         truncated: allVariantsResult.truncated,
         maxVariants: allVariantsResult.max,
-      };
+      });
     }
 
-    return { error: `Unknown intent: ${intent}`, inputs: { periodQtySoldLTE, lookBackDays } };
+    return json({ error: `Unknown intent: ${intent}`, inputs: { periodQtySoldLTE, lookBackDays } }, { status: 400 });
   } catch (e) {
-    console.error("Markdown Report action failed:", e);
+    logErr("action failed", msSince(t0), e);
 
     if (e instanceof Response) return e;
     if (e && typeof e === "object" && e.constructor?.name === "Response") return e;
 
-    return { error: e?.message ?? String(e) };
+    return json({ error: e?.message ?? String(e) }, { status: 500 });
   }
 }
 
@@ -707,6 +790,9 @@ export default function MarkdownReport() {
       return;
     }
 
+    // ✅ avoid scheduling while a request is in-flight (prevents double-post loops)
+    if (fullSyncFetcher.state !== "idle") return;
+
     const delay = Number(d.suggestedNextPollMs ?? 1500);
 
     const t = setTimeout(() => {
@@ -722,7 +808,7 @@ export default function MarkdownReport() {
     }, delay);
 
     return () => clearTimeout(t);
-  }, [fullSyncFetcher.data, currentInputs, fullSyncFetcher, actionUrl]);
+  }, [fullSyncFetcher.data, fullSyncFetcher.state, currentInputs, fullSyncFetcher, actionUrl]);
 
   // Report loop (continue)
   useEffect(() => {
@@ -733,6 +819,9 @@ export default function MarkdownReport() {
       setIsReportRunning(false);
       return;
     }
+
+    // ✅ avoid scheduling while a request is in-flight (prevents double-post loops)
+    if (reportFetcher.state !== "idle") return;
 
     const runId = r.runId;
     if (!runId) return;
@@ -750,7 +839,7 @@ export default function MarkdownReport() {
     }, 900);
 
     return () => clearTimeout(t);
-  }, [reportFetcher.data, reportFetcher, currentInputs, actionUrl]);
+  }, [reportFetcher.data, reportFetcher.state, reportFetcher, currentInputs, actionUrl]);
 
   const styles = {
     page: { padding: 16 },
@@ -827,7 +916,11 @@ export default function MarkdownReport() {
           <input type="hidden" name="intent" value="stockyQuickSync" />
           <input type="hidden" name="periodQtySoldLTE" value={currentInputs.periodQtySoldLTE ?? 0} />
           <input type="hidden" name="lookBackDays" value={currentInputs.lookBackDays ?? 60} />
-          <button type="submit" style={styles.smallButton} disabled={busy || fullSyncBusy || quickSyncBusy || isReportRunning}>
+          <button
+            type="submit"
+            style={styles.smallButton}
+            disabled={busy || fullSyncBusy || quickSyncBusy || isReportRunning}
+          >
             {quickSyncBusy ? "Quick Sync Running…" : "Quick Sync Stocky Cache"}
           </button>
         </quickSyncFetcher.Form>
@@ -845,11 +938,7 @@ export default function MarkdownReport() {
 
       <h1 style={styles.h1}>Markdown Report</h1>
 
-      <reportFetcher.Form
-        method="post"
-        action={actionUrl} // ✅ preserve embedded params
-        onSubmit={() => setIsReportRunning(true)}
-      >
+      <reportFetcher.Form method="post" action={actionUrl} onSubmit={() => setIsReportRunning(true)}>
         <input type="hidden" name="intent" value="reportStart" />
 
         <div style={styles.row}>
@@ -874,8 +963,8 @@ export default function MarkdownReport() {
           />
         </div>
 
-        <button style={styles.submit} type="submit" disabled={busy || fullSyncBusy || reportFetcher.state === "submitting"}>
-          {reportFetcher.state === "submitting" ? "Running…" : "SUBMIT"}
+        <button style={styles.submit} type="submit" disabled={busy || fullSyncBusy || reportFetcher.state !== "idle"}>
+          {reportFetcher.state !== "idle" ? "Running…" : "SUBMIT"}
         </button>
       </reportFetcher.Form>
 
