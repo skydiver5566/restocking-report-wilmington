@@ -725,7 +725,21 @@ export default function MarkdownReport() {
   const busy = navigation.state === "submitting";
 
   const location = useLocation();
-  const actionUrl = location.pathname + location.search; // ✅ preserve embedded params
+
+  // ✅ Keep ONLY the params we need. Don't include id_token/hmac/timestamp/session in POST URLs.
+  const actionUrl = useMemo(() => {
+    const sp = new URLSearchParams(location.search);
+    const keep = new URLSearchParams();
+
+    for (const k of ["shop", "host", "embedded", "locale"]) {
+      const v = sp.get(k);
+      if (v) keep.set(k, v);
+    }
+    if (!keep.get("embedded")) keep.set("embedded", "1");
+
+    const qs = keep.toString();
+    return qs ? `${location.pathname}?${qs}` : location.pathname;
+  }, [location.pathname, location.search]);
 
   const fullSyncFetcher = useFetcher();
   const quickSyncFetcher = useFetcher();
@@ -794,7 +808,7 @@ export default function MarkdownReport() {
         },
         { method: "post", action: actionUrl }
       );
-    }, 350); // ✅ faster polling with short server chunks
+    }, 350);
 
     return () => clearTimeout(t);
   }, [reportFetcher.data, reportFetcher.state, reportFetcher, currentInputs, actionUrl]);
